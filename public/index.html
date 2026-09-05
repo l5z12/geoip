@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Look up location, country and autonomous system data for a public IPv4 or IPv6 address, with complete GeoLite2 records.">
+  <meta name="referrer" content="no-referrer">
+  <title>GeoIP — IP lookup</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="doc-header"><div class="doc-meta-row"><span>GEOIP / LOOKUP</span><span>L5Z12</span></div><div class="doc-meta-row"><span>Location &amp; network</span><span>Public addresses only</span></div></header>
+    <main id="main" class="doc-body">
+      <div class="title-section"><h1>GeoIP</h1><p class="muted">A small reference for an IP address.</p></div>
+      <section aria-labelledby="lookup-heading">
+        <h2 id="lookup-heading"><span class="section-num">01.</span> Lookup</h2>
+        <form id="lookup-form">
+          <label for="ip">Public IP address</label>
+          <div class="form-row"><input id="ip" name="ip" type="text" placeholder="1.1.1.1 or 2606:4700:4700::1111" required maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="ip-help"><button type="submit">Look up</button></div>
+          <div class="own-row"><button id="own-ip" type="button">Use my IP</button><span id="ip-help" class="muted small">IPv4 or IPv6 · not a hostname</span></div>
+        </form>
+        <p class="small muted">No IP lookup runs until you ask. “Use my IP” looks up the public address seen by this service.</p>
+        <noscript><p>JavaScript is required for this form. You can also use the JSON API below.</p></noscript>
+        <p id="lookup-message" role="status" aria-live="polite" aria-atomic="true">Ready for an address.</p>
+        <div id="result" hidden aria-busy="false">
+          <h3>Result</h3>
+          <dl id="result-list"></dl>
+          <h3 id="records-heading">Complete database records</h3>
+          <p class="small muted" id="records-help">Expand each dataset and nested field to inspect every returned value, including localized names, arrays and optional traits. Field names are preserved from MaxMind. Missing records are not available; omitted fields are not inferred.</p>
+          <div id="record-inspector" class="record-inspector" role="group" aria-labelledby="records-heading" aria-describedby="records-help"></div>
+          <details id="raw-details"><summary>Raw JSON response</summary><pre tabindex="0" aria-label="JSON response"><code id="raw-json"></code></pre><button id="copy-json" type="button">Copy JSON</button><span id="copy-message" class="small" role="status" aria-live="polite"></span></details>
+        </div>
+      </section>
+      <section aria-labelledby="database-heading">
+        <h2 id="database-heading"><span class="section-num">02.</span> Database</h2>
+        <p id="database-message" role="status" aria-live="polite">Checking database availability…</p>
+        <dl id="database-list"></dl>
+        <ul id="database-sources" class="sources" aria-label="Database sources"></ul>
+        <button id="refresh-status" type="button">Refresh status</button>
+      </section>
+      <section aria-labelledby="api-heading">
+        <h2 id="api-heading"><span class="section-num">03.</span> JSON API</h2>
+        <p>Use <code>GET</code> with a public address, or omit <code>ip</code> to look up the caller. No API key required.</p>
+        <h3>IPv4</h3><pre tabindex="0" aria-label="IPv4 API example"><code id="api-ipv4">GET /api/lookup?ip=1.1.1.1</code></pre>
+        <h3>IPv6</h3><pre tabindex="0" aria-label="IPv6 API example"><code id="api-ipv6">GET /api/lookup?ip=2606%3A4700%3A4700%3A%3A1111</code></pre>
+        <h3>Caller address / database status</h3><pre tabindex="0" aria-label="Visitor and status API examples"><code id="api-other">GET /api/lookup
+GET /api/status</code></pre>
+        <p class="small muted">Any location or network field may be unavailable. The <code>records</code> object contains complete, unfiltered Country, City and ASN matches, or <code>null</code> where no record is available. Matched network values identify database address ranges. Errors return an <code>error</code> object with a <code>code</code> and <code>message</code>.</p>
+      </section>
+      <section aria-labelledby="notes-heading">
+        <h2 id="notes-heading"><span class="section-num">04.</span> About the result</h2>
+        <p>IP geolocation is approximate, not a person’s exact physical location or street address. VPNs, proxies, mobile networks and database age can affect the result. An ASN identifies an autonomous system, not an individual.</p>
+        <p>City names, postal codes and coordinates are estimates when available. Coordinates represent an approximate area; the accuracy radius is in kilometers, not a guarantee of precision. Missing values do not imply a negative answer. Availability of fields and traits depends on the matched GeoLite2 records.</p>
+        <p>This product includes GeoLite2 data created by <a href="https://www.maxmind.com" rel="external noreferrer">MaxMind</a>. Country, City and ASN databases are downloaded directly from MaxMind and checked daily for updates.</p>
+      </section>
+    </main>
+    <footer class="doc-footer"><span>GeoIP</span><span aria-hidden="true">/</span><a href="https://www.maxmind.com" rel="external noreferrer">MaxMind</a><a href="https://www.gnu.org/licenses/agpl-3.0.html" rel="license external noreferrer" title="Project code license; MaxMind data has separate terms">AGPL-3.0</a><button id="theme-btn" type="button" aria-label="Theme: Auto. Switch to Light.">Auto</button></footer>
+  </div>
+</body>
+</html>

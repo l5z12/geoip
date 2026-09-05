@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "geoip",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "geoip.l5z12.dev",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "r2_buckets": [
+    {
+      "binding": "GEOIP_DB",
+      "bucket_name": "geoip-databases"
+    }
+  ],
+  "triggers": {
+    "crons": ["37 6 * * *"]
+  },
+  "observability": {
+    "enabled": false
+  }
+}
