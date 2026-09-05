@@ -62,9 +62,15 @@ export async function downloadArchive(kind: DatabaseKind, authorization: string)
   for (let attempt = 0; attempt < 3; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120000);
+    const started = Date.now();
+    let failure = "network request failed";
+    console.log(`[${kind}] Downloading ${EDITIONS[kind]} (attempt ${attempt + 1}/3)`);
     try {
       // Native fetch strips Authorization when following cross-origin redirects.
       const response = await fetch(url, { headers: { Authorization: authorization }, signal: controller.signal });
+      // Never log headers, response bodies, or URLs (redirects can contain signed credentials).
+      console.log(`[${kind}] Download response: HTTP ${response.status}, redirected=${response.redirected}`);
+      failure = `HTTP ${response.status}${!response.body ? ", missing response body" : ""}`;
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         if (response.status === 401 || response.status === 403) throw new SafeError("MaxMind authentication or download entitlement failed");
@@ -74,6 +80,7 @@ export async function downloadArchive(kind: DatabaseKind, authorization: string)
         await response.body.cancel();
         throw new SafeError("MaxMind archive exceeds compressed size limit");
       }
+      failure = "response body read failed";
       const reader = response.body.getReader();
       const chunks: Uint8Array[] = [];
       let length = 0;
@@ -86,10 +93,13 @@ export async function downloadArchive(kind: DatabaseKind, authorization: string)
           chunks.push(value);
         }
       } finally { await reader.cancel().catch(() => {}); }
+      console.log(`[${kind}] Download complete: ${length} compressed bytes in ${Date.now() - started} ms`);
       return Buffer.concat(chunks, length);
     } catch (error) {
       if (error instanceof SafeError) throw error;
-      if (attempt === 2) throw new SafeError(`Unable to download ${EDITIONS[kind]} after three bounded attempts`);
+      if (controller.signal.aborted) failure = "120-second timeout";
+      console.warn(`[${kind}] Download attempt ${attempt + 1}/3 failed: ${failure}${attempt < 2 ? `; retrying in ${1000 * 2 ** attempt} ms` : ""}`);
+      if (attempt === 2) throw new SafeError(`Unable to download ${EDITIONS[kind]} after three bounded attempts: ${failure}`);
     } finally { clearTimeout(timer); }
     await Bun.sleep(1000 * 2 ** attempt);
   }
@@ -102,7 +112,10 @@ export async function main(): Promise<void> {
   const results = {} as Record<DatabaseKind, ReturnType<typeof extractArchive> & { buildEpoch: string; sha256: string; pageSha256: string[] }>;
   let total = 0;
   for (const kind of DATABASE_KINDS) {
-    const extracted = extractArchive(await downloadArchive(kind, authorization), EDITIONS[kind]);
+    const archive = await downloadArchive(kind, authorization);
+    console.log(`[${kind}] Extracting ${EDITIONS[kind]} archive`);
+    const extracted = extractArchive(archive, EDITIONS[kind]);
+    console.log(`[${kind}] Extracted ${extracted.database.length} MMDB bytes and ${Object.keys(extracted.notices).length} license notices; validating`);
     total += extracted.database.length;
     if (total > MAX_DATABASE_BYTES) throw new SafeError("Combined MMDB size exceeds 512 MiB storage safety budget");
     results[kind] = { ...extracted, buildEpoch: validateDatabase(kind, extracted.database), sha256: sha256(extracted.database), pageSha256: pageDigests(extracted.database) };

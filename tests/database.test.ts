@@ -34,6 +34,21 @@ test("synthetic MMDBs pass real reader, downloader and lookup validation", async
   expect(missing.records.country).toEqual({ registered_country: { iso_code: "US" } });
 });
 
+test("sparse anycast-style records validate and remain location-unknown at runtime", async () => {
+  for (const record of [{}, { registered_country: { iso_code: "US" } }, { traits: { is_anycast: true } }]) {
+    const data = dataset(undefined, { country: record, city: record });
+    for (const kind of DATABASE_KINDS) expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
+    const snapshot = await loadSnapshot(fakeBucket(data).bucket, data.manifest);
+    for (const address of [{ ip: "1.1.1.1", version: 4 as const }, { ip: "2606:4700:4700::1111", version: 6 as const }]) {
+      const result = await lookup(address, snapshot);
+      expect(result.country).toBeNull();
+      expect(result.records.country).toEqual(record);
+      expect(result.records.city).toEqual(record);
+      expect(result.asn?.number).toBe(13335);
+    }
+  }
+});
+
 test("manifests reject invalid keys, schemas and excessive memory", () => {
   const good = dataset().manifest;
   expect(parseManifest(good)).toEqual(good);

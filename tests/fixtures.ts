@@ -14,6 +14,11 @@ function encode(value: unknown): Buffer {
     const bytes = Buffer.from(value);
     return Buffer.concat([header(2, bytes.length), bytes]);
   }
+  if (typeof value === "number" && (!Number.isInteger(value) || value < 0 || value > 0xffffffff)) {
+    const bytes = Buffer.alloc(8);
+    bytes.writeDoubleBE(value);
+    return Buffer.concat([header(3, 8), bytes]);
+  }
   if (typeof value === "number") {
     const bytes = Buffer.alloc(4);
     bytes.writeUInt32BE(value);
@@ -44,10 +49,10 @@ export function mmdb(kind: DatabaseKind, epoch = Math.floor(Date.now() / 1000), 
   ]);
 }
 
-export function dataset(epoch = Math.floor(Date.now() / 1000)) {
-  const country = mmdb("country", epoch);
-  const city = mmdb("city", epoch);
-  const asn = mmdb("asn", epoch);
+export function dataset(epoch = Math.floor(Date.now() / 1000), records: Partial<Record<DatabaseKind, unknown>> = {}) {
+  const country = mmdb("country", epoch, records.country);
+  const city = mmdb("city", epoch, records.city);
+  const asn = mmdb("asn", epoch, records.asn);
   const files = { country, city, asn };
   const version = versionFor({ country: sha256(country), city: sha256(city), asn: sha256(asn) });
   const date = new Date(epoch * 1000).toISOString();

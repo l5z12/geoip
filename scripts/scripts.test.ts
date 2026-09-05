@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { Reader } from "mmdb-lib";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -76,26 +77,88 @@ test("page hashes include every full page and the short final page", () => {
   expect(pageDigests(bytes.subarray(0, PAGE_BYTES))).toEqual([sha256(bytes.subarray(0, PAGE_BYTES))]);
 });
 
-test("City validates dual-stack country and coordinates without requiring a city name", () => {
+test("Country and City accept omitted geolocation without requiring an anycast flag", () => {
   const epoch = Math.floor(Date.now() / 1000);
-  const record = { country: { iso_code: "US" }, location: { latitude: 0, longitude: 0 } };
-  expect(validateDatabase("city", mmdb("city", epoch, record))).toBe(new Date(epoch * 1000).toISOString());
-  for (const bad of [
-    { country: { iso_code: "US" } },
-    { ...record, country: { iso_code: "bad" } },
-    { ...record, location: { latitude: 91, longitude: 0 } },
-    { ...record, location: { latitude: 0, longitude: 181 } },
-    { ...record, location: { latitude: "0", longitude: 0 } },
-  ]) expect(() => validateDatabase("city", mmdb("city", epoch, bad))).toThrow("city MMDB failed");
-  expect(() => validateDatabase("city", mmdb("country", epoch, record))).toThrow();
-  expect(() => validateDatabase("city", mmdb("city", epoch - 31 * 86400))).toThrow();
-  expect(() => validateDatabase("city", mmdb("city", epoch + 3 * 86400))).toThrow();
+  for (const kind of ["country", "city"] as const) {
+    for (const record of [
+      {},
+      { registered_country: { iso_code: "US" } },
+      { traits: { is_anycast: true } },
+      { country: {} },
+      { country: { names: { en: "United States" } } },
+      { country: { iso_code: "US" } },
+      { location: {} },
+      { location: { time_zone: "America/New_York" } },
+      { location: { latitude: 0 } },
+      { location: { longitude: 0 } },
+      { location: { latitude: -90, longitude: -180 } },
+      { country: { iso_code: "US" }, location: { latitude: 38.5, longitude: -77.5 } },
+    ]) expect(validateDatabase(kind, mmdb(kind, epoch, record))).toBe(new Date(epoch * 1000).toISOString());
+  }
 });
 
-test("publication revalidates three databases, pages, full hashes and manifest identity", async () => {
+test("Country and City allow no-match probes; ASN still requires records", () => {
+  const epoch = Math.floor(Date.now() / 1000);
+  for (const kind of DATABASE_KINDS) {
+    const bytes = mmdb(kind, epoch);
+    // A pointer equal to node_count (1) denotes no record on either branch.
+    Buffer.from([0, 0, 1, 0, 0, 1]).copy(bytes);
+    if (kind === "asn") expect(() => validateDatabase(kind, bytes)).toThrow("record lookup for 1.1.1.1: missing record");
+    else expect(validateDatabase(kind, bytes)).toBe(new Date(epoch * 1000).toISOString());
+  }
+});
+
+test("optional geolocation still rejects malformed maps and country codes", () => {
+  for (const kind of ["country", "city"] as const) {
+    for (const record of ["not a map", [], 1]) {
+      expect(() => validateDatabase(kind, mmdb(kind, undefined, record))).toThrow("record validation for 1.1.1.1: expected a map");
+    }
+    for (const country of ["US", [], 1, false]) {
+      expect(() => validateDatabase(kind, mmdb(kind, undefined, { country }))).toThrow("country must be a map");
+    }
+    for (const iso_code of ["", "bad", "us", 1, false, []]) {
+      expect(() => validateDatabase(kind, mmdb(kind, undefined, { country: { iso_code } }))).toThrow("country.iso_code must be two uppercase letters");
+    }
+  }
+});
+
+test("City validates each coordinate when present without requiring its companion", () => {
+  for (const location of ["bad", [], 1, false]) {
+    expect(() => validateDatabase("city", mmdb("city", undefined, { location }))).toThrow("location must be a map");
+  }
+  for (const [field, values] of [
+    ["latitude", [91, -91, NaN, Infinity, -Infinity, "0", false]],
+    ["longitude", [181, -181, NaN, Infinity, -Infinity, "0", false]],
+  ] as const) {
+    for (const value of values) {
+      expect(() => validateDatabase("city", mmdb("city", undefined, { location: { [field]: value } }))).toThrow(`location.${field} must be finite`);
+    }
+  }
+});
+
+test("optional geolocation does not relax edition, freshness or ASN checks", () => {
+  const epoch = Math.floor(Date.now() / 1000);
+  expect(() => validateDatabase("city", mmdb("country", epoch, {}))).toThrow("metadata.databaseType: expected GeoLite2-City");
+  expect(() => validateDatabase("city", mmdb("city", epoch - 31 * 86400, {}))).toThrow("freshness: database older than 30 days");
+  expect(() => validateDatabase("city", mmdb("city", epoch + 3 * 86400, {}))).toThrow("freshness: database more than 2 days in the future");
+  expect(() => validateDatabase("asn", mmdb("asn", epoch, {}))).toThrow("autonomous_system_number");
+  expect(() => validateDatabase("asn", mmdb("asn", epoch, { autonomous_system_number: 13335 }))).toThrow("autonomous_system_organization");
+});
+
+test("lookup errors still fail with probe context and without dependency error text", () => {
+  const probe = spyOn(Reader.prototype, "get").mockImplementation(() => { throw new Error("secret signed URL"); });
+  try {
+    expect(() => validateDatabase("country", mmdb("country"))).toThrow(/^country MMDB failed record lookup for 1\.1\.1\.1: parser\/lookup error \(details suppressed\)$/);
+  } finally { probe.mockRestore(); }
+});
+
+test("publication accepts sparse geolocation while revalidating databases, hashes and manifest identity", async () => {
   const dir = await mkdtemp(join(tmpdir(), "geoip-publish-"));
   const dataDir = pathToFileURL(dir + "/");
-  const data = dataset();
+  const data = dataset(undefined, {
+    country: { registered_country: { iso_code: "US" } },
+    city: { registered_country: { iso_code: "US" } },
+  });
   try {
     for (const kind of DATABASE_KINDS) await writeFile(new URL(`${kind}.mmdb`, dataDir), data[kind]);
     const save = async (manifest: unknown) => writeFile(new URL("manifest.json", dataDir), JSON.stringify(manifest));

@@ -15,36 +15,87 @@ export function pageDigests(bytes: Uint8Array): string[] {
 // Hash lowercase hex digests in DATABASE_KINDS order, without separators.
 export const versionFor = (digests: Record<DatabaseKind, string>) => sha256(DATABASE_KINDS.map(k => digests[k]).join(""));
 
+// Describe malformed fields without dumping database strings or entire records.
+function valueSummary(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "string") return `string(length=${value.length})`;
+  return Array.isArray(value) ? "array" : typeof value;
+}
+
+function isMap(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export function validateDatabase(kind: DatabaseKind, bytes: Buffer, now = Date.now()): string {
-  if (!bytes.length || bytes.length > MAX_DATABASE_BYTES) throw new SafeError(`Invalid ${kind} database size`);
+  if (!bytes.length || bytes.length > MAX_DATABASE_BYTES) throw new SafeError(`Invalid ${kind} database size: ${bytes.length} bytes`);
+  function fail(reason: string): never { throw new SafeError(`${kind} MMDB failed ${reason}`); }
+  let stage = "parsing";
   try {
     const reader = new Reader(bytes);
+    stage = "metadata validation";
     const metadata = reader.metadata;
-    const build = metadata.buildEpoch.getTime();
-    if (metadata.databaseType !== EDITIONS[kind] || metadata.ipVersion !== 6 ||
-        metadata.binaryFormatMajorVersion !== 2 || !Number.isFinite(build) ||
-        now - build > 30 * 86400000 || build - now > 2 * 86400000) {
-      throw new Error("metadata");
-    }
+    if (metadata.databaseType !== EDITIONS[kind]) fail(`metadata.databaseType: expected ${EDITIONS[kind]}`);
+    if (metadata.ipVersion !== 6) fail(`metadata.ipVersion: expected 6, got ${valueSummary(metadata.ipVersion)}`);
+    if (metadata.binaryFormatMajorVersion !== 2) fail(`metadata.binaryFormatMajorVersion: expected 2, got ${valueSummary(metadata.binaryFormatMajorVersion)}`);
+    const build = metadata.buildEpoch instanceof Date ? metadata.buildEpoch.getTime() : NaN;
+    if (!Number.isFinite(build)) fail("metadata.buildEpoch: invalid timestamp");
+    const buildEpoch = metadata.buildEpoch.toISOString();
+    const ageDays = ((now - build) / 86400000).toFixed(2);
+    const freshness = `build=${buildEpoch}, checkedAt=${new Date(now).toISOString()}, ageDays=${ageDays}`;
+    if (now - build > 30 * 86400000) fail(`freshness: database older than 30 days (${freshness})`);
+    if (build - now > 2 * 86400000) fail(`freshness: database more than 2 days in the future (${freshness})`);
+    console.log(`[${kind}] MMDB metadata valid: edition=${EDITIONS[kind]}, ipVersion=6, format=2, bytes=${bytes.length}, ${freshness}`);
     for (const ip of ["1.1.1.1", "8.8.8.8", "9.9.9.9", "2606:4700:4700::1111", "2001:4860:4860::8888", "2620:fe::fe"]) {
-      const record = reader.get(ip) as unknown as Record<string, unknown> | null;
-      if (!record) throw new Error("missing record");
+      stage = `record lookup for ${ip}`;
+      const record: unknown = reader.get(ip);
+      // MaxMind may omit geolocation entirely for anycast networks. A null lookup
+      // is different from a decoder error, which must still reject the database.
+      if (record === null) {
+        if (kind === "asn") fail(`${stage}: missing record`);
+        console.log(`[${kind}] Probe ${ip}: no geolocation record (allowed)`);
+        continue;
+      }
+      stage = `record validation for ${ip}`;
+      if (!isMap(record)) fail(`${stage}: expected a map (got ${valueSummary(record)})`);
       if (kind === "country" || kind === "city") {
-        const country = record.country as { iso_code?: unknown } | undefined;
-        if (typeof country?.iso_code !== "string" || !/^[A-Z]{2}$/.test(country.iso_code)) throw new Error("country schema");
-        if (kind === "city") {
-          const location = record.location as { latitude?: unknown; longitude?: unknown } | undefined;
-          if (typeof location?.latitude !== "number" || !Number.isFinite(location.latitude) || Math.abs(location.latitude) > 90 ||
-              typeof location.longitude !== "number" || !Number.isFinite(location.longitude) || Math.abs(location.longitude) > 180) throw new Error("city location schema");
+        // Undefined/empty values are omitted in MaxMind records. Do not require
+        // traits.is_anycast or substitute registered_country for a location.
+        const country = record.country;
+        if (country !== undefined && !isMap(country)) fail(`${stage}: country must be a map (got ${valueSummary(country)})`);
+        const code = country?.iso_code;
+        if (code !== undefined && (typeof code !== "string" || !/^[A-Z]{2}$/.test(code))) {
+          fail(`${stage}: country.iso_code must be two uppercase letters when present (got ${valueSummary(code)})`);
         }
-      } else if (!Number.isSafeInteger(record.autonomous_system_number) ||
-                 (record.autonomous_system_number as number) <= 0 ||
-                 typeof record.autonomous_system_organization !== "string" ||
-                 !record.autonomous_system_organization.trim()) throw new Error("ASN schema");
+        console.log(`[${kind}] Probe ${ip}: country.iso_code ${code === undefined ? "absent (allowed)" : "valid"}`);
+        if (kind === "city") {
+          const location = record.location;
+          if (location !== undefined && !isMap(location)) fail(`${stage}: location must be a map (got ${valueSummary(location)})`);
+          const latitude = location?.latitude;
+          const longitude = location?.longitude;
+          if (latitude !== undefined && (typeof latitude !== "number" || !Number.isFinite(latitude) || Math.abs(latitude) > 90)) {
+            fail(`${stage}: location.latitude must be finite and within [-90, 90] when present (got ${valueSummary(latitude)})`);
+          }
+          if (longitude !== undefined && (typeof longitude !== "number" || !Number.isFinite(longitude) || Math.abs(longitude) > 180)) {
+            fail(`${stage}: location.longitude must be finite and within [-180, 180] when present (got ${valueSummary(longitude)})`);
+          }
+          console.log(`[${kind}] Probe ${ip}: latitude ${latitude === undefined ? "absent (allowed)" : "valid"}, longitude ${longitude === undefined ? "absent (allowed)" : "valid"}`);
+        }
+      } else {
+        if (!Number.isSafeInteger(record.autonomous_system_number) || (record.autonomous_system_number as number) <= 0) {
+          fail(`${stage}: autonomous_system_number must be a positive safe integer (got ${valueSummary(record.autonomous_system_number)})`);
+        }
+        if (typeof record.autonomous_system_organization !== "string" || !record.autonomous_system_organization.trim()) {
+          fail(`${stage}: autonomous_system_organization must be a non-empty string (got ${valueSummary(record.autonomous_system_organization)})`);
+        }
+      }
     }
-    return metadata.buildEpoch.toISOString();
-  } catch {
-    throw new SafeError(`${kind} MMDB failed metadata, freshness, or public dual-stack record validation`);
+    console.log(`[${kind}] All 6 public IPv4/IPv6 record probes passed`);
+    return buildEpoch;
+  } catch (error) {
+    if (error instanceof SafeError) throw error;
+    // Never include dependency messages, stack traces, or raw MMDB records.
+    throw new SafeError(`${kind} MMDB failed ${stage}: parser/lookup error (details suppressed)`);
   }
 }
 
