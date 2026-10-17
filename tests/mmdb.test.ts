@@ -44,6 +44,8 @@ test("existing synthetic country/ASN databases and lazy IPv4 initialization", as
   for (const kind of ["country", "asn"] as const) {
     const input = source(mmdb(kind, 1700000000));
     const reader = await AsyncMmdb.open(input);
+    // Opening reads the tail and separator only; metadata fields reuse the tail.
+    expect(input.calls).toHaveLength(2);
     expect(reader.metadata.databaseType).toBe(kind === "country" ? "GeoLite2-Country" : "GeoLite2-ASN");
     expect(reader.metadata.buildEpoch).toBe("2023-11-14T22:13:20.000Z");
     expect(input.calls.filter(([offset, length]) => offset === 0 && length === 6)).toHaveLength(0);

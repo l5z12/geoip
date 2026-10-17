@@ -1,11 +1,11 @@
 import { Buffer } from "node:buffer";
 import { expect, test } from "bun:test";
 import { AsyncMmdb } from "../src/mmdb";
-import { DATABASE_KINDS } from "../src/manifest";
+import { DATABASE_KINDS, PAGE_BYTES } from "../src/manifest";
 import { DatabaseStore, loadSnapshot, lookup } from "../src/database";
 import { MAX_DATABASE_BYTES, parseManifest } from "../src/manifest";
 import { validateDatabase } from "../scripts/shared";
-import { dataset, fakeBucket, mmdb } from "./fixtures";
+import { dataset, fakeBucket, gate, mmdb } from "./fixtures";
 
 test("synthetic MMDBs pass real reader, downloader and lookup validation", async () => {
   const data = dataset();
@@ -67,6 +67,120 @@ test("concurrent requests share one load, cached reads do not hit R2", async () 
   expect(fake.calls.length).toBe(4);
   await store.get();
   expect(fake.calls.length).toBe(4);
+});
+
+test("cold initialization overlaps metadata reads across all three databases", async () => {
+  const reads = gate();
+  const data = dataset(undefined, {}, PAGE_BYTES * 3);
+  const fake = fakeBucket(data, () => reads.promise);
+  const pending = loadSnapshot(fake.bucket, data.manifest);
+  try {
+    await Bun.sleep(0);
+    // Each metadata tail straddles two pages; all six requests must start
+    // before any completes, rather than six sequential storage round trips.
+    expect(fake.calls).toHaveLength(6);
+    for (const kind of DATABASE_KINDS) expect(fake.calls.filter(key => key === data.manifest.files[kind].key)).toHaveLength(2);
+  } finally {
+    reads.release();
+    await pending;
+  }
+});
+
+test("warm requests serve a validated snapshot while one background refresh switches generations", async () => {
+  let now = Math.floor(Date.now() / 1000) * 1000;
+  const old = dataset(now / 1000 - 3600);
+  const refresh = gate();
+  let hold = false;
+  const fake = fakeBucket(old, async () => { if (hold) await refresh.promise; });
+  const store = new DatabaseStore(fake.bucket, () => now);
+  const first = await store.get();
+  const next = dataset(now / 1000);
+  fake.install(next);
+  hold = true;
+  now += 300_001;
+  const background: Promise<unknown>[] = [];
+  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  try {
+    const response = await store.get(context);
+    expect(response.snapshot).toBe(first.snapshot);
+    expect(response.stale).toBe(false);
+    expect((await store.get(context)).snapshot).toBe(first.snapshot);
+    expect(background).toHaveLength(2);
+    expect(background[0]).toBe(background[1]);
+    expect(fake.calls.filter(key => key === "manifest.json")).toHaveLength(2);
+  } finally {
+    refresh.release();
+    await Promise.all(background);
+  }
+  expect((await store.get(context)).snapshot.manifest.version).toBe(next.manifest.version);
+});
+
+test("background refresh failure reports stale, throttles retries and recovers", async () => {
+  let now = Date.now();
+  const fake = fakeBucket();
+  const store = new DatabaseStore(fake.bucket, () => now);
+  const first = await store.get();
+  fake.objects.delete("manifest.json");
+  now += 300_001;
+  const background: Promise<unknown>[] = [];
+  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  expect((await store.get(context)).snapshot).toBe(first.snapshot);
+  await Promise.all(background);
+  const calls = fake.calls.length;
+  expect((await store.get(context)).stale).toBe(true);
+  expect(fake.calls).toHaveLength(calls);
+  fake.install(dataset());
+  now += 30_001;
+  await store.get(context);
+  await Promise.all(background);
+  expect((await store.get(context)).stale).toBe(false);
+});
+
+test("cold requests with a context still wait for validation", async () => {
+  const reads = gate();
+  const fake = fakeBucket(undefined, () => reads.promise);
+  const store = new DatabaseStore(fake.bucket);
+  const background: Promise<unknown>[] = [];
+  let returned = false;
+  const pending = store.get({ waitUntil(promise) { background.push(promise); } }).then(result => {
+    returned = true;
+    return result;
+  });
+  try {
+    await Bun.sleep(0);
+    expect(returned).toBe(false);
+    expect(background).toHaveLength(0);
+  } finally {
+    reads.release();
+    await pending;
+  }
+});
+
+test("an expiring snapshot cannot bypass an already pending background refresh", async () => {
+  let now = Math.floor(Date.now() / 1000) * 1000;
+  const old = dataset(now / 1000 - 30 * 86400 + 600);
+  const refresh = gate();
+  let hold = false;
+  const fake = fakeBucket(old, async () => { if (hold) await refresh.promise; });
+  const store = new DatabaseStore(fake.bucket, () => now);
+  await store.get();
+  now += 300_001;
+  hold = true;
+  const background: Promise<unknown>[] = [];
+  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  await store.get(context);
+  now += 300_001;
+  let returned = false;
+  const expired = store.get(context).then(() => { returned = true; }, () => { returned = true; });
+  try {
+    await Bun.sleep(0);
+    expect(returned).toBe(false);
+    expect(background).toHaveLength(1);
+  } finally {
+    refresh.release();
+    await Promise.all([...background, expired]);
+  }
+  await expect(store.get(context)).rejects.toThrow("not available");
 });
 
 test("bad refresh keeps old pair, throttles retries, then atomically switches both", async () => {

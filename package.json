@@ -10,6 +10,7 @@
     "check": "tsc --noEmit",
     "test": "bun test",
     "test:runtime": "bun run build && bun tests/runtime-smoke.ts",
+    "bench:lookup": "bun tests/lookup-benchmark.ts",
     "build": "wrangler deploy --dry-run --outdir dist",
     "deploy": "wrangler deploy",
     "db:download": "bun scripts/download-databases.ts",

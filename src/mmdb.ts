@@ -3,6 +3,7 @@ import ipaddr from "ipaddr.js";
 
 export interface ByteSource {
   readonly size: number;
+  /** Returned bytes may be a view of shared cached data; callers must not mutate them. */
   read(offset: number, length: number): Promise<Uint8Array>;
 }
 
@@ -143,7 +144,13 @@ export class AsyncMmdb {
     if (marker < 0) fail("metadata marker missing");
     const dataEnd = tailStart + marker;
     const metadataStart = dataEnd + MARKER.length;
-    const [raw] = await new Decoder(source, metadataStart, source.size).decode(metadataStart);
+    // The complete metadata is already in the tail. Decode it locally so tiny
+    // field reads cannot re-fetch pages evicted by other concurrent lookups.
+    const metadataSource: ByteSource = {
+      size: source.size,
+      read: async (offset, length) => tail.subarray(offset - tailStart, offset - tailStart + length),
+    };
+    const [raw] = await new Decoder(metadataSource, metadataStart, source.size).decode(metadataStart);
     if (!object(raw)) fail("metadata is not a map");
     const m = raw as Record<string, unknown>;
     const nodeCount = m.node_count;

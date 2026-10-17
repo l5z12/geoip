@@ -91,16 +91,24 @@ export class PageCache {
             offset < 0 || length < 0 || length > MAX_READ_BYTES || offset + length > file.bytes) {
           throw new Error("Database read is outside allowed bounds");
         }
+        if (length === 0) return new Uint8Array();
+        const first = Math.floor(offset / PAGE_BYTES);
+        const last = Math.floor((offset + length - 1) / PAGE_BYTES);
+        if (first === last) {
+          const page = await this.page(file, first);
+          return page.subarray(offset % PAGE_BYTES, offset % PAGE_BYTES + length);
+        }
+        // Metadata and straddling values need multiple known pages. Fetch them
+        // together under the shared download limit instead of serial round trips.
+        const pages = await Promise.allSettled(Array.from({ length: last - first + 1 },
+          (_, index) => this.page(file, first + index)));
         const output = new Uint8Array(length);
-        let copied = 0;
-        while (copied < length) {
-          const position = offset + copied;
-          const index = Math.floor(position / PAGE_BYTES);
-          const page = await this.page(file, index);
-          const start = position % PAGE_BYTES;
-          const count = Math.min(page.length - start, length - copied);
-          output.set(page.subarray(start, start + count), copied);
-          copied += count;
+        for (const [index, result] of pages.entries()) {
+          if (result.status === "rejected") throw result.reason;
+          const position = (first + index) * PAGE_BYTES;
+          const start = Math.max(offset - position, 0);
+          const end = Math.min(offset + length - position, result.value.length);
+          output.set(result.value.subarray(start, end), Math.max(position - offset, 0));
         }
         return output;
       },

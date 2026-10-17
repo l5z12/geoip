@@ -46,14 +46,20 @@ function pageCache(bucket: R2Bucket): PageCache {
 export async function loadSnapshot(bucket: R2Bucket, manifest: Manifest): Promise<Snapshot> {
   const cache = pageCache(bucket);
   const readers = {} as Snapshot["readers"];
-  for (const kind of DATABASE_KINDS) {
+  // These files are independent. Drain every read even if one fails, so a
+  // failed load cannot leave R2 work running after its request has completed.
+  const opened = await Promise.allSettled(DATABASE_KINDS.map(async (kind) => {
     const file = manifest.files[kind];
     const reader = await AsyncMmdb.open(cache.source(file));
     if (reader.metadata.ipVersion !== 6 || reader.metadata.databaseType !== EDITIONS[kind] ||
         reader.metadata.buildEpoch !== file.buildEpoch) {
       throw new Error("Database metadata mismatch");
     }
-    readers[kind] = reader;
+    return reader;
+  }));
+  for (const [index, result] of opened.entries()) {
+    if (result.status === "rejected") throw result.reason;
+    readers[DATABASE_KINDS[index]!] = result.value;
   }
   return { manifest, readers };
 }
@@ -71,10 +77,16 @@ export class DatabaseStore {
     private loader = loadSnapshot,
   ) {}
 
-  async get(): Promise<{ snapshot: Snapshot; stale: boolean }> {
+  async get(context?: Pick<ExecutionContext, "waitUntil">): Promise<{ snapshot: Snapshot; stale: boolean }> {
     if (this.clock() >= this.nextCheck) {
       if (!this.pending) this.pending = this.refresh().finally(() => { this.pending = undefined; });
-      await this.pending;
+      // Only a validated, unexpired snapshot may bypass the refresh. Keep the
+      // refresh alive with this request's context, never a retained context.
+      if (context && this.snapshot && isFresh(this.snapshot.manifest, this.clock())) {
+        context.waitUntil(this.pending);
+      } else {
+        await this.pending;
+      }
     }
     if (!this.snapshot || !isFresh(this.snapshot.manifest, this.clock())) throw new DatabaseUnavailable();
     return { snapshot: this.snapshot, stale: this.refreshFailed };

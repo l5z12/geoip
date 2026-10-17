@@ -26,7 +26,7 @@ function error(code: string, message: string, status: number): Response {
   return json({ error: { code, message } }, status);
 }
 
-async function api(request: Request, env: Env, url: URL): Promise<Response> {
+async function api(request: Request, env: Env, url: URL, context?: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   if (url.pathname !== "/api/lookup" && url.pathname !== "/api/status") {
     return error("NOT_FOUND", "API endpoint not found.", 404);
   }
@@ -45,7 +45,7 @@ async function api(request: Request, env: Env, url: URL): Promise<Response> {
   }
   try {
     if (url.pathname === "/api/status") {
-      const { snapshot, stale } = await getStore(env.GEOIP_DB).get();
+      const { snapshot, stale } = await getStore(env.GEOIP_DB).get(context);
       return json({ status: stale ? "degraded" : "ok", database: databaseInfo(snapshot.manifest, stale) });
     }
     const values = url.searchParams.getAll("ip");
@@ -58,7 +58,7 @@ async function api(request: Request, env: Env, url: URL): Promise<Response> {
       return error("CLIENT_IP_UNAVAILABLE", "Your IP is unavailable here. Enter an IP address explicitly.", 400);
     }
     const address = parseIp(input);
-    const { snapshot, stale } = await getStore(env.GEOIP_DB).get();
+    const { snapshot, stale } = await getStore(env.GEOIP_DB).get(context);
     return json(await lookup(address, snapshot, stale));
   } catch (cause) {
     if (cause instanceof IpError) return error(cause.code, cause.message, 400);
@@ -72,12 +72,12 @@ async function api(request: Request, env: Env, url: URL): Promise<Response> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, context?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     let response: Response;
     const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
     if (isApi) {
-      response = await api(request, env, url);
+      response = await api(request, env, url, context);
       // Explicit-address queries are public. Do not expose a visitor's IP to
       // arbitrary websites via CORS; that endpoint is intentionally same-origin.
       if (url.pathname === "/api/status" || url.searchParams.has("ip")) {

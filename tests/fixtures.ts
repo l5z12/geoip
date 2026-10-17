@@ -2,6 +2,12 @@ import { Buffer } from "node:buffer";
 import { sha256, versionFor } from "../scripts/shared";
 import { DATABASE_KINDS, PAGE_BYTES, type DatabaseKind, type Manifest } from "../src/manifest";
 
+export function gate() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+}
+
 // A tiny, synthetic MMDB with one search node and a record on each branch.
 // No licensed database or network download is needed to run the test suite.
 function encode(value: unknown): Buffer {
@@ -30,7 +36,7 @@ function encode(value: unknown): Buffer {
   return Buffer.concat([header(7, pairs.length), ...pairs.flatMap(([k, v]) => [encode(k), encode(v)])]);
 }
 
-export function mmdb(kind: DatabaseKind, epoch = Math.floor(Date.now() / 1000), record?: unknown): Buffer {
+export function mmdb(kind: DatabaseKind, epoch = Math.floor(Date.now() / 1000), record?: unknown, paddingBytes = 0): Buffer {
   const data = record ?? (kind === "asn"
     ? { autonomous_system_number: 13335, autonomous_system_organization: "Fixture Network" }
     : { country: { iso_code: "US", names: { en: "United States" } },
@@ -42,17 +48,17 @@ export function mmdb(kind: DatabaseKind, epoch = Math.floor(Date.now() / 1000), 
         } : {}),
       });
   return Buffer.concat([
-    Buffer.from([0, 0, 17, 0, 0, 17]), Buffer.alloc(16), encode(data),
+    Buffer.from([0, 0, 17, 0, 0, 17]), Buffer.alloc(16), encode(data), Buffer.alloc(paddingBytes),
     Buffer.from("abcdef4d61784d696e642e636f6d", "hex"),
     encode({ node_count: 1, record_size: 24, ip_version: 6, database_type: { country: "GeoLite2-Country", city: "GeoLite2-City", asn: "GeoLite2-ASN" }[kind],
       build_epoch: epoch, binary_format_major_version: 2, binary_format_minor_version: 0, description: {} }),
   ]);
 }
 
-export function dataset(epoch = Math.floor(Date.now() / 1000), records: Partial<Record<DatabaseKind, unknown>> = {}) {
-  const country = mmdb("country", epoch, records.country);
-  const city = mmdb("city", epoch, records.city);
-  const asn = mmdb("asn", epoch, records.asn);
+export function dataset(epoch = Math.floor(Date.now() / 1000), records: Partial<Record<DatabaseKind, unknown>> = {}, paddingBytes = 0) {
+  const country = mmdb("country", epoch, records.country, paddingBytes);
+  const city = mmdb("city", epoch, records.city, paddingBytes);
+  const asn = mmdb("asn", epoch, records.asn, paddingBytes);
   const files = { country, city, asn };
   const version = versionFor({ country: sha256(country), city: sha256(city), asn: sha256(asn) });
   const date = new Date(epoch * 1000).toISOString();
@@ -67,7 +73,7 @@ export function dataset(epoch = Math.floor(Date.now() / 1000), records: Partial<
   return { country, city, asn, manifest };
 }
 
-export function fakeBucket(data = dataset()) {
+export function fakeBucket(data = dataset(), beforeGet?: (key: string) => Promise<void>) {
   const objects = new Map<string, Buffer>();
   const calls: string[] = [];
   function install(next: ReturnType<typeof dataset>) {
@@ -78,6 +84,7 @@ export function fakeBucket(data = dataset()) {
   const bucket = {
     async get(key: string, options?: { range?: { offset: number; length: number } }) {
       calls.push(key);
+      await beforeGet?.(key);
       const bytes = objects.get(key);
       if (!bytes) return null;
       const range = options?.range;
