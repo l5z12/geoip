@@ -54,11 +54,16 @@ async function api(
   }
   try {
     if (url.pathname === "/api/status") {
-      const { snapshot, stale } = await getStore(env.GEOIP_DB).get(context);
-      return json({
-        status: stale ? "degraded" : "ok",
-        database: databaseInfo(snapshot.manifest, stale),
-      });
+      const start = performance.now();
+      const { snapshot, stale } = await getStore(env.GEOIP_DB, url.origin).get(context);
+      return json(
+        {
+          status: stale ? "degraded" : "ok",
+          database: databaseInfo(snapshot.manifest, stale),
+        },
+        200,
+        { "Server-Timing": `database;dur=${(performance.now() - start).toFixed(1)}` },
+      );
     }
     const values = url.searchParams.getAll("ip");
     if (values.length > 1) return error("INVALID_IP", "Supply only one IP address.", 400);
@@ -75,8 +80,13 @@ async function api(
       );
     }
     const address = parseIp(input);
-    const { snapshot, stale } = await getStore(env.GEOIP_DB).get(context);
-    return json(await lookup(address, snapshot, stale));
+    const start = performance.now();
+    const { snapshot, stale } = await getStore(env.GEOIP_DB, url.origin).get(context);
+    const ready = performance.now();
+    const result = await lookup(address, snapshot, stale);
+    return json(result, 200, {
+      "Server-Timing": `database;dur=${(ready - start).toFixed(1)}, lookup;dur=${(performance.now() - ready).toFixed(1)}`,
+    });
   } catch (cause) {
     if (cause instanceof IpError) return error(cause.code, cause.message, 400);
     if (cause instanceof DatabaseUnavailable || cause instanceof PageUnavailable) {
@@ -99,6 +109,7 @@ export default {
       // arbitrary websites via CORS; that endpoint is intentionally same-origin.
       if (url.pathname === "/api/status" || url.searchParams.has("ip")) {
         response.headers.set("Access-Control-Allow-Origin", "*");
+        response.headers.set("Access-Control-Expose-Headers", "Server-Timing");
       }
     } else {
       response = await env.ASSETS.fetch(request);

@@ -1,7 +1,8 @@
 import { expect, test } from "vitest";
 import { Buffer } from "node:buffer";
+import { setTimeout as sleep } from "node:timers/promises";
 import { AsyncMmdb, type ByteSource } from "../src/mmdb";
-import { mmdb } from "./fixtures";
+import { gate, mmdb } from "./fixtures";
 
 const marker = Buffer.from("abcdef4d61784d696e642e636f6d", "hex");
 function header(type: number, size: number): Uint8Array {
@@ -284,4 +285,145 @@ test("metadata marker is required and the last marker is authoritative", async (
   const truncated = source(bytes);
   truncated.read = async () => new Uint8Array();
   await expect(AsyncMmdb.open(truncated)).rejects.toThrow("short");
+});
+
+function pointer(target: number): Buffer {
+  const bytes = Buffer.alloc(5);
+  bytes[0] = 0x38;
+  bytes.writeUInt32BE(target, 1);
+  return bytes;
+}
+
+test("independent pointers start together and shared targets are not mistaken for cycles", async () => {
+  const data = Buffer.alloc(2048);
+  data.set(map({ first: pointer(512), second: pointer(1024), shared: pointer(512) }));
+  data.set(map({ found: str("first") }), 512);
+  data.set(map({ found: str("second") }), 1024);
+  const input = source(fixture(data));
+  const original = input.read;
+  const reads = gate();
+  const started: number[] = [];
+  input.read = async (offset, length) => {
+    if ((offset === 22 + 512 || offset === 22 + 1024) && length === 1) {
+      started.push(offset);
+      await reads.promise;
+    }
+    return original(offset, length);
+  };
+  const reader = await AsyncMmdb.open(input);
+  const pending = reader.getWithPrefixLength("1.1.1.1");
+  try {
+    await sleep(0);
+    expect(started.sort()).toEqual([22 + 512, 22 + 512, 22 + 1024].sort());
+  } finally {
+    reads.release();
+    expect(await pending).toEqual([
+      { first: { found: "first" }, second: { found: "second" }, shared: { found: "first" } },
+      1,
+    ]);
+  }
+});
+
+test("pointer map keys, arrays, duplicate keys and prototype-named fields resolve correctly", async () => {
+  const data = Buffer.alloc(2048);
+  data.set(
+    Buffer.concat([
+      header(7, 3),
+      pointer(512),
+      str("old"),
+      pointer(512),
+      str("new"),
+      str("array"),
+      header(11, 2),
+      pointer(1024),
+      pointer(1536),
+    ]),
+  );
+  data.set(str("__proto__"), 512);
+  data.set(str("first"), 1024);
+  data.set(map({ nested: str("last") }), 1536);
+  const reader = await AsyncMmdb.open(source(fixture(data)));
+  const [record] = await reader.getWithPrefixLength("1.1.1.1");
+  expect(record).toEqual({ ["__proto__"]: "new", array: ["first", { nested: "last" }] });
+  expect(Object.getPrototypeOf(record)).toBe(Object.prototype);
+
+  data.set(pointer(1536), 1024);
+  data.set(pointer(1024), 1536);
+  const cyclic = await AsyncMmdb.open(source(fixture(data)));
+  await expect(cyclic.getWithPrefixLength("1.1.1.1")).rejects.toThrow("pointer cycle");
+});
+
+test("pointer failure waits for started siblings to settle before rejecting", async () => {
+  const data = Buffer.alloc(2048);
+  data.set(map({ broken: pointer(512), slow: pointer(1024) }));
+  data.set(str("slow"), 1024);
+  const input = source(fixture(data));
+  const original = input.read;
+  const broken = gate();
+  const slow = gate();
+  input.read = async (offset, length) => {
+    if (offset === 22 + 512) {
+      await broken.promise;
+      throw new Error("pointer storage failure");
+    }
+    if (offset === 22 + 1024) await slow.promise;
+    return original(offset, length);
+  };
+  const reader = await AsyncMmdb.open(input);
+  let settled = false;
+  const result = reader.getWithPrefixLength("1.1.1.1").then(
+    () => {
+      settled = true;
+      return undefined;
+    },
+    (error: unknown) => {
+      settled = true;
+      return error;
+    },
+  );
+  try {
+    await sleep(0);
+    broken.release();
+    await sleep(0);
+    expect(settled).toBe(false);
+  } finally {
+    broken.release();
+    slow.release();
+    expect(await result).toEqual(new Error("pointer storage failure"));
+  }
+});
+
+test("pointer fan-out is bounded even for a wide record", async () => {
+  const data = Buffer.alloc(1024);
+  data.set(
+    map(
+      Object.fromEntries(Array.from({ length: 64 }, (_, index) => [String(index), pointer(900)])),
+    ),
+  );
+  data.set(str("shared"), 900);
+  const input = source(fixture(data));
+  const original = input.read;
+  const reads = gate();
+  let active = 0;
+  let maximum = 0;
+  input.read = async (offset, length) => {
+    if (offset === 922 && length === 1) {
+      active++;
+      maximum = Math.max(maximum, active);
+      await reads.promise;
+      active--;
+    }
+    return original(offset, length);
+  };
+  const reader = await AsyncMmdb.open(input);
+  const result = reader.getWithPrefixLength("1.1.1.1");
+  try {
+    await sleep(0);
+    // 32 parallel pointer branches plus the scanner's serial fallback.
+    expect(maximum).toBeLessThanOrEqual(33);
+    expect(maximum).toBeGreaterThan(1);
+  } finally {
+    reads.release();
+    expect(Object.keys((await result)[0]!)).toHaveLength(64);
+  }
 });

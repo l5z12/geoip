@@ -109,6 +109,60 @@ test("cold initialization overlaps metadata reads across all three databases", a
   }
 });
 
+test("scattered records preserve the full result while overlapping independent page reads", async () => {
+  const reads = gate();
+  const data = dataset(undefined, {}, 0, true);
+  const started: number[] = [];
+  let hold = false;
+  const fake = fakeBucket(data, async (key, offset) => {
+    if (hold && key === data.manifest.files.city.key && offset !== undefined) {
+      started.push(offset);
+      await reads.promise;
+    }
+  });
+  const snapshot = await loadSnapshot(fake.bucket, data.manifest);
+  const inline = dataset();
+  const expected = await loadSnapshot(fakeBucket(inline).bucket, inline.manifest);
+  hold = true;
+  const result = lookup({ ip: "1.1.1.1", version: 4 }, snapshot);
+  try {
+    await sleep(0);
+    // The last field's page was warmed by the metadata tail; the other six
+    // city field pages must start while all their responses are held back.
+    expect(started.length).toBeGreaterThanOrEqual(6);
+  } finally {
+    reads.release();
+    expect((await result).records).toEqual(
+      (await lookup({ ip: "1.1.1.1", version: 4 }, expected)).records,
+    );
+  }
+});
+
+test("a failing dataset lookup drains the other readers before rejecting", async () => {
+  const data = dataset();
+  const snapshot = await loadSnapshot(fakeBucket(data).bucket, data.manifest);
+  const slow = gate();
+  snapshot.readers.country.getWithPrefixLength = async () => {
+    throw new Error("country failed");
+  };
+  snapshot.readers.city.getWithPrefixLength = async () => {
+    await slow.promise;
+    return [null, 0];
+  };
+  let settled = false;
+  const result = lookup({ ip: "1.1.1.1", version: 4 }, snapshot).catch((error: unknown) => {
+    settled = true;
+    return error;
+  });
+  try {
+    await sleep(0);
+    expect(settled).toBe(false);
+  } finally {
+    slow.release();
+    expect(await result).toEqual(new Error("country failed"));
+  }
+});
+
 test("warm requests serve a validated snapshot while one background refresh switches generations", async () => {
   let now = Math.floor(Date.now() / 1000) * 1000;
   const old = dataset(now / 1000 - 3600);

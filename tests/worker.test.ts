@@ -19,6 +19,10 @@ test("explicit dual-stack lookups return JSON with CORS and no shared caching", 
     expect(response.status).toBe(200);
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Server-Timing")).toMatch(
+      /^database;dur=\d+\.\d, lookup;dur=\d+\.\d$/,
+    );
+    expect(response.headers.get("Access-Control-Expose-Headers")).toBe("Server-Timing");
     expect(((await response.json()) as { country: { code: string } }).country.code).toBe("US");
   }
 });
@@ -37,6 +41,7 @@ test("caller IP trusts edge headers only and is not exposed through CORS", async
   );
   expect(response.status).toBe(200);
   expect(response.headers.has("Access-Control-Allow-Origin")).toBe(false);
+  expect(response.headers.has("Access-Control-Expose-Headers")).toBe(false);
   expect(((await response.json()) as { ip: string }).ip).toBe("2606:4700::1111");
   const missing = await worker.fetch(
     req("/api/lookup", { headers: { "X-Forwarded-For": "8.8.8.8" } }),
@@ -60,6 +65,7 @@ test("empty, repeated, invalid and nonpublic query values return 400 before load
 test("status, HEAD, OPTIONS, unsupported methods and unknown endpoints", async () => {
   const env = environment();
   const status = await worker.fetch(req("/api/status"), env);
+  expect(status.headers.get("Server-Timing")).toMatch(/^database;dur=\d+\.\d$/);
   expect(((await status.json()) as { status: string }).status).toBe("ok");
   const head = await worker.fetch(req("/api/lookup?ip=1.1.1.1", { method: "HEAD" }), env);
   expect(head.status).toBe(200);

@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { sha256, versionFor } from "../scripts/shared";
 import { DATABASE_KINDS, PAGE_BYTES, type DatabaseKind, type Manifest } from "../src/manifest";
+import type { EdgePages, PageStorage } from "../src/pages";
 
 export function gate() {
   let release!: () => void;
@@ -47,6 +48,7 @@ export function mmdb(
   epoch = Math.floor(Date.now() / 1000),
   record?: unknown,
   paddingBytes = 0,
+  scattered = false,
 ): Buffer {
   const data =
     record ??
@@ -73,7 +75,7 @@ export function mmdb(
   return Buffer.concat([
     Buffer.from([0, 0, 17, 0, 0, 17]),
     Buffer.alloc(16),
-    encode(data),
+    scattered ? scatter(data) : encode(data),
     Buffer.alloc(paddingBytes),
     Buffer.from("abcdef4d61784d696e642e636f6d", "hex"),
     encode({
@@ -91,14 +93,33 @@ export function mmdb(
   ]);
 }
 
+// A map whose values live on independent pages, as in real MMDB pointer graphs.
+// This exposes serial pointer reads that tiny inline fixtures cannot measure.
+function scatter(data: unknown): Buffer {
+  const entries = Object.entries(data as Record<string, unknown>);
+  const bytes = Buffer.alloc((entries.length + 1) * PAGE_BYTES);
+  const fields = [Buffer.from([0xe0 | entries.length])];
+  for (const [index, [key, value]] of entries.entries()) {
+    const target = (index + 1) * PAGE_BYTES;
+    const pointer = Buffer.alloc(5);
+    pointer[0] = 0x38;
+    pointer.writeUInt32BE(target, 1);
+    fields.push(encode(key), pointer);
+    bytes.set(encode(value), target);
+  }
+  bytes.set(Buffer.concat(fields));
+  return bytes;
+}
+
 export function dataset(
   epoch = Math.floor(Date.now() / 1000),
   records: Partial<Record<DatabaseKind, unknown>> = {},
   paddingBytes = 0,
+  scattered = false,
 ) {
-  const country = mmdb("country", epoch, records.country, paddingBytes);
-  const city = mmdb("city", epoch, records.city, paddingBytes);
-  const asn = mmdb("asn", epoch, records.asn, paddingBytes);
+  const country = mmdb("country", epoch, records.country, paddingBytes, scattered);
+  const city = mmdb("city", epoch, records.city, paddingBytes, scattered);
+  const asn = mmdb("asn", epoch, records.asn, paddingBytes, scattered);
   const files = { country, city, asn };
   const version = versionFor({ country: sha256(country), city: sha256(city), asn: sha256(asn) });
   const date = new Date(epoch * 1000).toISOString();
@@ -124,7 +145,10 @@ export function dataset(
   return { country, city, asn, manifest };
 }
 
-export function fakeBucket(data = dataset(), beforeGet?: (key: string) => Promise<void>) {
+export function fakeBucket(
+  data = dataset(),
+  beforeGet?: (key: string, offset?: number) => Promise<void>,
+) {
   const objects = new Map<string, Buffer>();
   const calls: string[] = [];
   function install(next: ReturnType<typeof dataset>) {
@@ -135,7 +159,7 @@ export function fakeBucket(data = dataset(), beforeGet?: (key: string) => Promis
   const bucket = {
     async get(key: string, options?: { range?: { offset: number; length: number } }) {
       calls.push(key);
-      await beforeGet?.(key);
+      await beforeGet?.(key, options?.range?.offset);
       const bytes = objects.get(key);
       if (!bytes) return null;
       const range = options?.range;
@@ -158,4 +182,30 @@ export function fakeBucket(data = dataset(), beforeGet?: (key: string) => Promis
     },
   } as unknown as R2Bucket;
   return { bucket, objects, calls, install };
+}
+
+export function fakeEdgePages() {
+  const entries = new Map<string, Response>();
+  const storage: PageStorage = {
+    async match(key) {
+      const response = entries.get(key);
+      if (!response) return undefined;
+      // Cache.match returns an independent body, not one half of a stream tee.
+      return new Response(await response.clone().arrayBuffer(), {
+        status: response.status,
+        headers: response.headers,
+      });
+    },
+    async put(key, response) {
+      entries.set(
+        key,
+        new Response(await response.arrayBuffer(), {
+          status: response.status,
+          headers: response.headers,
+        }),
+      );
+    },
+  };
+  const edge: EdgePages = { origin: "https://geoip.example", open: async () => storage };
+  return { entries, storage, edge };
 }

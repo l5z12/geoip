@@ -49,17 +49,29 @@ export function isFresh(manifest: Manifest, now: number): boolean {
 }
 
 const pageCaches = new WeakMap<R2Bucket, PageCache>();
-function pageCache(bucket: R2Bucket): PageCache {
+function pageCache(bucket: R2Bucket, origin?: string): PageCache {
   let cache = pageCaches.get(bucket);
   if (!cache) {
-    cache = new PageCache(bucket);
+    cache = new PageCache(
+      bucket,
+      undefined,
+      origin && typeof caches !== "undefined"
+        ? {
+            origin,
+            open: () => caches.open("geoip-mmdb-pages-v1"),
+          }
+        : undefined,
+    );
     pageCaches.set(bucket, cache);
   }
   return cache;
 }
 
-export async function loadSnapshot(bucket: R2Bucket, manifest: Manifest): Promise<Snapshot> {
-  const cache = pageCache(bucket);
+export async function loadSnapshot(
+  bucket: R2Bucket,
+  manifest: Manifest,
+  cache = pageCache(bucket),
+): Promise<Snapshot> {
   const readers = {} as Snapshot["readers"];
   // These files are independent. Drain every read even if one fails, so a
   // failed load cannot leave R2 work running after its request has completed.
@@ -135,10 +147,13 @@ export class DatabaseStore {
 }
 
 const stores = new WeakMap<R2Bucket, DatabaseStore>();
-export function getStore(bucket: R2Bucket): DatabaseStore {
+export function getStore(bucket: R2Bucket, origin?: string): DatabaseStore {
   let store = stores.get(bucket);
   if (!store) {
-    store = new DatabaseStore(bucket);
+    const cache = pageCache(bucket, origin);
+    store = new DatabaseStore(bucket, Date.now, (bucket, manifest) =>
+      loadSnapshot(bucket, manifest, cache),
+    );
     stores.set(bucket, store);
   }
   return store;
@@ -152,9 +167,13 @@ function object(value: unknown): Record<string, unknown> | null {
 const regions = new Intl.DisplayNames(["en"], { type: "region" });
 
 export async function lookup(address: ParsedIp, snapshot: Snapshot, stale = false) {
-  const matches = await Promise.all(
+  const results = await Promise.allSettled(
     DATABASE_KINDS.map((kind) => snapshot.readers[kind].getWithPrefixLength(address.ip)),
   );
+  const matches = results.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
   const records = Object.fromEntries(
     DATABASE_KINDS.map((kind, i) => [kind, matches[i]![0]]),
   ) as Record<DatabaseKind, Record<string, unknown> | null>;
