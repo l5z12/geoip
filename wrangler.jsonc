@@ -22,6 +22,7 @@
       "bucket_name": "geoip-databases"
     }
   ],
+  "d1_databases": [{ "binding": "GEOIP_LOOKUP", "database_name": "geoip-lookup-local" }],
   "triggers": {
     "crons": ["37 6 * * *"]
   },

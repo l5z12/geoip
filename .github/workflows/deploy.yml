@@ -12,7 +12,7 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     environment: production
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +38,7 @@ jobs:
           MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_MAX_BYTES: ${{ vars.D1_MAX_BYTES }}
       - name: Deploy Worker
         run: pnpm run deploy
         env:

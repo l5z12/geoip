@@ -19,6 +19,8 @@ export interface DatabaseFile {
   sha256: string;
   pageSha256: string[];
   buildEpoch: string;
+  /** Optional prefetch hint, verified against the MMDB metadata before use. */
+  searchTreeSize?: number;
 }
 
 export interface Manifest {
@@ -71,6 +73,14 @@ export function parseManifest(value: unknown): Manifest {
     ) {
       throw new Error(`Invalid ${kind} database descriptor`);
     }
+    if (
+      file.searchTreeSize !== undefined &&
+      (typeof file.searchTreeSize !== "number" ||
+        !Number.isSafeInteger(file.searchTreeSize) ||
+        file.searchTreeSize < 0 ||
+        file.searchTreeSize > file.bytes - 16)
+    )
+      throw new Error(`Invalid ${kind} search tree size`);
     total += file.bytes;
   }
   if (total > MAX_DATABASE_BYTES) throw new Error("Databases exceed the storage safety budget");

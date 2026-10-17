@@ -1,23 +1,23 @@
 # GeoIP
 
-Cloudflare Worker for public IPv4/IPv6 lookups using **GeoLite2 City, Country, and ASN, with complete MaxMind records**. Uses Node.js and pnpm, MaxMind GeoLite2 databases downloaded **directly from MaxMind**, and private R2 storage. No mirrored data or external lookup service. The interface follows `d:\l5z12\l5z12`: a narrow document layout, monospace headings, quiet rules, and persistent Auto / Light / Dark themes.
+Cloudflare Worker for public IPv4/IPv6 lookups using **GeoLite2 City, Country, and ASN, with complete MaxMind records**. Uses Node.js and pnpm, MaxMind GeoLite2 databases downloaded **directly from MaxMind**, D1 for indexed lookups, and private R2 storage for original MMDB archives. No mirrored data or external lookup service. The interface follows `d:\l5z12\l5z12`: a narrow document layout, monospace headings, quiet rules, and persistent Auto / Light / Dark themes.
 
 ## Deploy with GitHub Actions
 
-1. Enable Cloudflare Workers and R2 in your account, and ensure `l5z12.dev` is an active Cloudflare zone in that same account. R2 may require billing setup; Workers/R2 usage charges and limits apply.
+1. Enable Cloudflare Workers, D1, and R2 in your account, and ensure `l5z12.dev` is an active Cloudflare zone in that same account. R2 may require billing setup; Workers, D1, and R2 usage charges and limits apply.
 2. Create a MaxMind account, accept the [GeoLite2 terms](https://www.maxmind.com/en/geolite2/eula), and generate a license key with database download access. You need the **account ID as well as the key**. A web-services-only key without GeoLite2 download entitlement is not sufficient.
 3. Add these GitHub Actions secrets (repository secrets or the `production` environment):
 
-   | Secret                  | Value                                                                                                                                            |
-   | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-   | `MAXMIND_ACCOUNT_ID`    | MaxMind account ID                                                                                                                               |
-   | `MAXMIND_LICENSE_KEY`   | MaxMind license/API key with download access                                                                                                     |
-   | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID                                                                                                                            |
-   | `CLOUDFLARE_API_TOKEN`  | **Workers Scripts: Edit** and **Workers R2 Storage: Edit** for the account; **Zone: Read** and **Workers Routes: Edit** for the `l5z12.dev` zone |
+   | Secret                  | Value                                                                                                                                                           |
+   | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `MAXMIND_ACCOUNT_ID`    | MaxMind account ID                                                                                                                                              |
+   | `MAXMIND_LICENSE_KEY`   | MaxMind license/API key with download access                                                                                                                    |
+   | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID                                                                                                                                           |
+   | `CLOUDFLARE_API_TOKEN`  | **Workers Scripts: Edit**, **D1: Edit**, and **Workers R2 Storage: Edit** for the account; **Zone: Read** and **Workers Routes: Edit** for the `l5z12.dev` zone |
 
    Enable the account's `workers.dev` subdomain in the Cloudflare dashboard if not already configured; it remains available alongside the custom domain. Do not paste credentials into code, issues, or workflow files.
 
-4. Push this project to a GitHub repository's `main` branch (or run **Deploy** manually from that branch). Deployment validates the project, creates `geoip-databases` if missing, downloads and publishes all three databases, and deploys the `geoip` Worker at **https://geoip.l5z12.dev**. Wrangler also prints its `workers.dev` URL.
+4. Push this project to a GitHub repository's `main` branch (or run **Deploy** manually from that branch). Deployment validates the project, creates `geoip-databases` if missing, downloads all three databases, imports and validates an inactive D1 slot, archives the originals in R2, and deploys the `geoip` Worker at **https://geoip.l5z12.dev**. The existing `workers.dev` route remains enabled.
 
 The Worker/bucket names and custom domain live in `wrangler.jsonc`. Deployment registers `geoip.l5z12.dev` as a Workers Custom Domain; Cloudflare manages its DNS record and TLS certificate. Do not create a CNAME pointing at `workers.dev`. If this hostname already has a conflicting DNS record or Worker binding, resolve that conflict before deployment. Allow time for DNS and certificate provisioning after the first deployment.
 
@@ -27,7 +27,7 @@ The bucket is dedicated to this application and should remain private: **do not 
 
 - **CI**: every push and pull request; frozen pnpm install, formatting check, typecheck, unit tests, bundle, and real `workerd` smoke test. No credentials or MaxMind downloads required.
 - **Deploy**: pushes to `main` and manual dispatch; validates, provisions, publishes databases, then deploys.
-- **Update databases**: daily at **04:23 UTC**, or manual dispatch; downloads directly from MaxMind and updates R2 without redeploying the Worker. Daily checks do not imply MaxMind publishes a new release daily.
+- **Update databases**: daily at **04:23 UTC**, or manual dispatch; downloads directly from MaxMind and imports a changed release into D1, archives it in R2, and redeploys the Worker to select the validated slot. An unchanged release skips the D1 import. Daily checks do not imply MaxMind publishes a new release daily.
 - Deploy/update workflows share a non-cancelling concurrency group. Ensure the `production` environment permits unattended scheduled jobs. GitHub schedules can be delayed and public-repository schedules can be disabled after inactivity; monitor failed/missing runs and re-enable them if needed.
 - A Worker cron at **06:37 UTC** removes superseded R2 generations older than 29 days, preserving the active generation. It is not the downloader; database updates run in GitHub Actions.
 
@@ -42,7 +42,7 @@ pnpm run db:local
 pnpm run dev
 ```
 
-Open `http://localhost:8787`. `db:local` downloads real MaxMind data, validates it, and publishes to Wrangler's **local** R2 emulator. Cloudflare credentials are not needed for this mode. Without databases the page still loads and the API returns a clear `503`. Caller-IP lookup may not be available locally; enter a public IP explicitly.
+Open `http://localhost:8787`. `db:local` downloads real MaxMind data, validates it, and imports into Wrangler's **local** D1 emulator and archives into its local R2 emulator. Cloudflare credentials are not needed for this mode. Without databases the page still loads and the API returns a clear `503`. Caller-IP lookup may not be available locally; enter a public IP explicitly.
 
 ```sh
 pnpm run check          # strict TypeScript
@@ -50,15 +50,15 @@ pnpm run format         # format source, configuration, and documentation
 pnpm run format:check   # check formatting without changing files
 pnpm run hooks:check    # run prek hooks against all tracked files
 pnpm test               # deterministic unit tests; synthetic MMDB fixtures
-pnpm run test:runtime   # bundle + real workerd/R2 lookup smoke test
-pnpm run bench:lookup   # synthetic storage-latency benchmark (no network or credentials)
+pnpm run test:runtime   # bundle + real workerd/D1 smoke test with empty R2
+pnpm run bench:lookup   # indexed SQLite benchmark (excludes D1 network latency)
 pnpm run db:download    # MaxMind -> .data/, validate all three databases
-pnpm run db:publish     # .data/ -> remote R2 (Cloudflare credentials required)
+pnpm run db:publish     # .data/ -> inactive D1 + R2 archives; prepares deployment
 pnpm run infra:ensure   # create/verify remote bucket
-pnpm run deploy         # deploy code/assets only; publish databases first
+pnpm run deploy         # verify the prepared release and switch the Worker binding
 ```
 
-Use **Node.js 24** (at least 24.10.0) and **pnpm 10.34.7**. The pnpm version is pinned in `package.json`; workflows use `.node-version` and `pnpm-lock.yaml`. Tests use Vitest; TypeScript scripts run on Node.js with tsx. Database scripts load `.env` when present, with existing environment variables taking precedence. `.env`, `.data`, local R2 state, database archives, and MMDBs are ignored by Git. No database artifacts are uploaded to GitHub. Local `.data/licenses/` retains notices provided by MaxMind archives.
+Use **Node.js 24** (at least 24.10.0) and **pnpm 10.34.7**. The pnpm version is pinned in `package.json`; workflows use `.node-version` and `pnpm-lock.yaml`. Tests use Vitest; TypeScript scripts run on Node.js with tsx. Database scripts load `.env` when present, with existing environment variables taking precedence. `.env`, `.data`, `.wrangler-release.json`, local D1/R2 state, database archives, and MMDBs are ignored by Git. No database artifacts are uploaded to GitHub. Local `.data/licenses/` retains notices provided by MaxMind archives.
 
 Prettier and prek are pinned development dependencies, so no global installation is needed. Run `pnpm run hooks:install` once per clone to enable the pre-commit hook. It formats changed text files with the project's Prettier version; if it changes a staged file, review and stage that file again before committing. CI and deployment use `pnpm run format:check` to reject formatting drift without rewriting files. `.prettierignore` excludes generated output, private data, and the pnpm lockfile. Git and Prettier use LF line endings; `wrangler.jsonc` is formatted as strict JSON because the database scripts parse it with `JSON.parse`.
 
@@ -82,41 +82,42 @@ Lookup responses contain:
 
 Missing source fields remain absent; no data is invented. Country and City can report different countries, so their original records remain separate. Values beyond JavaScript's safe integer range are represented as decimal strings; MMDB binary values use `{ "$type": "bytes", "base64": "…" }` for lossless JSON. Paid GeoIP2 Enterprise, ISP, Anonymous IP, and other separately licensed datasets are not included by a GeoLite2 subscription or downloaded by this configuration.
 
-Valid public addresses with no match return `200` with nullable fields. Invalid, private, reserved, documentation, and transition addresses return `400`; unavailable or expired databases return `503` with `Retry-After: 30`. Errors use `{ "error": { "code": "…", "message": "…" } }`. `/api/status` returns `status: "ok"` or `"degraded"` with the same database metadata, or `503` if no usable pair exists.
+Valid public addresses with no match return `200` with nullable fields. Invalid, private, reserved, documentation, and transition addresses return `400`; unavailable or expired databases return `503` with `Retry-After: 30`. Errors use `{ "error": { "code": "…", "message": "…" } }`. `/api/status` returns `status: "ok"` with the same database metadata, or `503` if the selected release is unavailable, incomplete, or expired. `database.stale` remains `false`; a failed update leaves the previous validated release selected until it expires.
 
 Only literal addresses are accepted, not hostnames, CIDR input, ports, zone IDs, or ambiguous/octal IPv4 notation. `GET`, `HEAD`, and `OPTIONS` are supported. Explicit-IP lookups and status allow public CORS; the caller-IP endpoint is same-origin to avoid exposing visitors' IPs to arbitrary websites. Responses use `Cache-Control: no-store`. Visitor addresses come only from Cloudflare's connecting-IP headers (including Pseudo IPv4's IPv6 header), never `X-Forwarded-For`.
 
-Successful responses include `Server-Timing`: `database` measures snapshot initialization/refresh waiting, and `lookup` measures tree traversal and record decoding. Durations are milliseconds spent in the Worker, excluding the client's network round trip. Explicit-IP and status responses expose this header through CORS so external clients can inspect it.
+Successful responses include `Server-Timing`: `lookup` measures the D1 query and response assembly. Lookup `database` initialization is zero because no MMDB is opened; status uses `database` for its metadata query. Durations are milliseconds spent in the Worker, excluding the client's network round trip. Explicit-IP and status responses expose this header through CORS so external clients can inspect it.
 
 ## Storage, updates, and operations
 
-MMDBs are **not bundled with the Worker or loaded whole into memory**. A paged MMDB reader traverses the original search trees and decodes complete records using private R2 range reads. A shared **32 MiB LRU cache** holds 256 KiB pages across all datasets and versions, with at most eight page downloads in flight. Each page is checked against its SHA-256 digest in the manifest. This supports the much larger City database within Workers' 128 MiB memory limit. Startup opens all three databases concurrently, and reads spanning page boundaries fetch their pages concurrently under the same download limit. Metadata is decoded from its already-fetched tail, and single-page reads use views of cached bytes without allocating a copy for each field.
+The Worker uses **one D1 query per lookup** to fetch release metadata plus the complete Country, City, and ASN records. It does **zero R2 reads** during lookup or status requests. There is no per-IP result cache and fresh addresses use the same indexed path as repeated ones. The MMDB decoder runs only in CI/local import scripts and is absent from the Worker bundle.
 
-Verified pages also use the named `geoip-mmdb-pages-v1` [Cloudflare Cache API cache](https://developers.cloudflare.com/workers/runtime-apis/cache/), with a 24-hour TTL and keys based on the database content hash and page index. This cache can survive isolate restarts within a data center; it is opportunistic and is not replicated between data centers. Every cache hit is checked against the current manifest's page hash before use. Missing, corrupt, or unavailable cache entries fall back to R2, and cache-write failures do not fail lookups. Cached pages have no public route; lookup addresses and API responses are never stored there. The active manifest still comes from R2, and freshness checks still apply.
+CI converts each MMDB leaf into a disjoint address interval. IPv4 keys use eight hexadecimal digits; IPv6 keys use 32, preserving every bit without JavaScript integer rounding. The `(kind, family, start)` primary key seeks the preceding interval; the query checks its end after `LIMIT 1`, avoiding table scans for missing addresses. Records are stored once per MMDB record pointer and referenced by ranges. Original prefix lengths and complete JSON records are retained. The importer includes all IPv4 ranges and the IPv6 `2000::/3` space accepted by the API; IPv4 aliases do not duplicate whole trees.
 
-Record decoding scans inline fields while starting independent pointer targets concurrently, so fields on separate pages do not each add a serial storage round trip. It limits parallel pointer branches to 32 per record (with serial fallback), retains depth/operation/payload limits and branch-specific cycle detection, and drains started reads before returning an error. Shared pointer targets, duplicate map keys, arbitrary fields, and the full original records remain supported.
+[D1 read replication](https://developers.cloudflare.com/d1/best-practices/read-replication/) is enabled automatically. Each request uses its own `first-unconstrained` session so it can read a nearby replica. The Worker checks both the expected content version and import schema version. If a replica is unavailable or still has the old slot contents, it retries the primary. An incomplete or expired release is never served. One query is one binding request, **not one billable row read**; D1 accounts for rows read by the query and index operations.
 
-The active manifest is checked at most every five minutes per isolate; concurrent loads are coalesced. Once a validated, unexpired snapshot is available, requests serve it immediately while the check runs through [`ctx.waitUntil()`](https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil). New generations become active only after all three readers pass validation. Cold requests and requests whose snapshot has expired wait for validation; expired data is never served. `database.stale` reflects the last completed refresh. Cold lookups can still require multiple dependent R2 range reads; warm paths reuse cached pages. Use the Workers paid plan for CPU/subrequest headroom and benchmark latency/cost for your traffic.
+### Publication
 
-`pnpm run bench:lookup` measures cold initialization, warm IPv4/IPv6 lookups, a lookup during a scheduled refresh, and a cold lookup with fields scattered across independent pages. It also recreates the isolate's memory cache while retaining a simulated edge cache. It uses synthetic MMDBs, a fixed 100 ms delay per R2 read, and an in-memory edge-cache simulation; no credentials or licensed data are needed. In a three-run comparison against the previous decoder, median scattered cold lookup time fell from 988 ms to 440 ms with the same 17 R2 reads. A fresh isolate reusing verified edge pages took 115 ms and one R2 read (the manifest). These compare code paths under controlled latency, exclude real edge-cache latency, and are not production latency predictions.
+1. Download directly from MaxMind. Validate archive bounds, edition, dual-stack probes, complete records, build freshness, and whole-file/page SHA-256 hashes. The combined original MMDB size remains capped at 512 MiB.
+2. Read the live Worker's D1 binding. Use the other slot, `geoip-lookup-a` or `geoip-lookup-b`, creating it if needed. Reuse a ready active release when its data and schema versions already match. An unexpected live binding aborts publication.
+3. Build a local SQLite database with deduplicated records and indexed ranges. Compare sample lookups with the original MMDBs and report row counts and file size. Export statements below 90 KB, at most 500 rows each, into files of at most 64 MiB. Imports do not contain explicit transactions.
+4. Import into the inactive slot. Validate imported row counts and IPv4/IPv6 records, then mark it ready. The live binding stays unchanged throughout the import.
+5. Archive original MMDBs and the version manifest under `versions/<sha256>/` in private R2. Write R2's `manifest.json` last. R2 is the archive, not the live D1 selector.
+6. Save an ignored deployment receipt only after D1 validation and R2 publication succeed. `pnpm run deploy` checks the account, configuration, live binding, and ready release before deploying with the selected D1 ID and expected version. Both workflows perform this step.
 
-Each update validates tar/gzip size bounds, archive structure, MMDB type, dual-stack sample records, and build freshness. Country/City probes allow missing geolocation (including for anycast IPs) and validate field types and coordinate ranges when present; missing geography is not database corruption. It calculates whole-file and per-page SHA-256 hashes, uploads a content-addressed generation under `versions/<sha256>/`, followed by an immutable version manifest, and **writes `manifest.json` last**. A failed pre-publication update leaves the old active pointer untouched. Worker refresh failures preserve the previous working generation and set `database.stale`; retries are throttled to 30 seconds. Data more than 30 days old is not served. Combined stored MMDB size is capped at 512 MiB; this is a storage/download safety bound, not a Worker memory allocation. Corrupt or unavailable pages return a retryable `503`.
+The two slots bound storage growth. Only the inactive slot is rebuilt; the previous release remains in the other slot until a subsequent update reuses it. Do not run manual publications concurrently with CI or use gradual deployments with these reusable slots. Both workflows share the same serialization group. Import and archive failures leave the live Worker binding unchanged. Serving still depends on D1 availability and account-wide quotas; exhausting a quota can affect both slots. Monitor failed jobs because the selected data still expires after 30 days. A failed deployment should be checked in Cloudflare before retrying. Raw archive cleanup retains the newest archived generation and removes superseded R2 generations after 29 days.
 
-All MMDB value types and 24-, 28-, and 32-bit search trees are supported. The reader enforces offset, nesting, container, and decode-operation bounds. Full feature support means exposing everything these databases actually contain, not inferring absent information. IP geolocation and coordinates are approximate (consider `location.accuracy_radius`), cannot identify an individual, and are not suitable for street-level location or emergency services.
+### Capacity and validation
 
-No application IP logging, analytics, or third-party browser requests are implemented; Workers observability is disabled by default. Cloudflare or infrastructure you enable may still retain request metadata. The API is public and unauthenticated: add Cloudflare rate limiting/WAF rules as appropriate before exposing it to significant traffic. Monitor `/api/status`, GitHub jobs, R2 usage, and cron failures. Delete retained/local databases when required by your MaxMind agreement, including if access is terminated; automatic cleanup is not a substitute for reviewing license obligations.
+The importer defaults to a conservative **500,000,000-byte local build limit**. [D1 limits](https://developers.cloudflare.com/d1/platform/limits/) depend on your plan: Free allows 500 MB per database and paid allows up to 10 GB. If a real release exceeds the default, the job stops before importing. On an account with sufficient capacity, set the GitHub repository/environment variable `D1_MAX_BYTES` (or the local environment variable) to the permitted ceiling, at most `10000000000`. Budget for both slots and account-wide storage/write quotas. The [Free plan has a 100,000-row daily write allowance](https://developers.cloudflare.com/d1/platform/pricing/); a full GeoLite import can exceed that even when it fits the storage limit. Use the emitted row counts to plan capacity, and expect a paid plan for full dataset refreshes. Paid imports still count toward usage. The logged SQLite size is a preflight estimate; D1 enforces its actual limits during import.
+
+Tests cover 24-, 28-, and 32-bit MMDB trees, exact IPv4/IPv6 boundaries, gaps, original prefix lengths, sparse/full records, SQL escaping, indexed query plans, failed import validation, unready/expired releases, and stale replica fallback. The runtime smoke test imports generated SQL into real workerd D1 and exercises concurrent cold lookups and isolate restarts with **empty R2**. `bench:lookup` measures 1,000 distinct local SQLite lookups across 750,000 synthetic ranges; it does not predict production D1 network latency. Licensed production database size and deployed latency must be measured during rollout.
+
+The API remains public and unauthenticated. No application IP logging, analytics, or third-party browser requests are implemented; Workers observability remains disabled. Infrastructure may retain request metadata. Monitor `/api/status`, GitHub jobs, D1 quotas/latency, R2 usage, and cron failures. Retain and remove licensed data according to your MaxMind agreement.
 
 ### Rollback
 
-Redeploy an earlier Worker commit for code rollback. For data rollback, while the desired validated generation remains in R2 and all builds are under 30 days old:
-
-```sh
-pnpm exec wrangler r2 object get geoip-databases/versions/VERSION/manifest.json --file .data/rollback.json --remote
-# Inspect the manifest; confirm all three referenced MMDB objects still exist.
-pnpm exec wrangler r2 object put geoip-databases/manifest.json --file .data/rollback.json --remote
-```
-
-Coordinate manual rollback with update jobs and the cleanup cron. Active isolates observe the pointer within five minutes. Do not commit rollback manifests containing licensed data; local artifacts remain ignored.
+A Worker version rollback can reuse the previous D1 slot only while that slot still contains the expected, unexpired release. Slots are reused on later updates, so older Worker versions are not permanent data backups. For data recovery, download the desired archived `manifest.json` and its three referenced MMDB objects into `.data/` as `manifest.json`, `country.mmdb`, `city.mmdb`, and `asn.mmdb`; then run `pnpm run db:publish` and `pnpm run deploy`. Publication revalidates hashes, metadata, and freshness before staging the archive into the inactive slot. Coordinate manual recovery with the update jobs. Changing R2's active manifest alone does not switch D1.
 
 ## Code license
 

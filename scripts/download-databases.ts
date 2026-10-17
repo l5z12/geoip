@@ -18,6 +18,7 @@ import {
   runMain,
   SafeError,
   sha256,
+  searchTreeSize,
   validateDatabase,
   versionFor,
 } from "./shared";
@@ -205,6 +206,7 @@ export async function main(): Promise<void> {
           sha256: results[k].sha256,
           pageSha256: results[k].pageSha256,
           buildEpoch: results[k].buildEpoch,
+          searchTreeSize: searchTreeSize(results[k].database),
         },
       ]),
     ) as Manifest["files"],

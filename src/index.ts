@@ -1,11 +1,11 @@
 import { cleanupDatabases } from "./cleanup";
-import { DatabaseUnavailable, getStore, lookup } from "./database";
+import { DatabaseUnavailable, lookup, status } from "./database";
 import { IpError, parseIp } from "./ip";
-import { PageUnavailable } from "./pages";
-import { databaseInfo } from "./manifest";
 
 export interface Env {
   GEOIP_DB: R2Bucket;
+  GEOIP_LOOKUP: D1Database;
+  GEOIP_VERSION?: string;
   ASSETS: Fetcher;
 }
 
@@ -27,12 +27,7 @@ function error(code: string, message: string, status: number): Response {
   return json({ error: { code, message } }, status);
 }
 
-async function api(
-  request: Request,
-  env: Env,
-  url: URL,
-  context?: Pick<ExecutionContext, "waitUntil">,
-): Promise<Response> {
+async function api(request: Request, env: Env, url: URL): Promise<Response> {
   if (url.pathname !== "/api/lookup" && url.pathname !== "/api/status") {
     return error("NOT_FOUND", "API endpoint not found.", 404);
   }
@@ -55,15 +50,10 @@ async function api(
   try {
     if (url.pathname === "/api/status") {
       const start = performance.now();
-      const { snapshot, stale } = await getStore(env.GEOIP_DB, url.origin).get(context);
-      return json(
-        {
-          status: stale ? "degraded" : "ok",
-          database: databaseInfo(snapshot.manifest, stale),
-        },
-        200,
-        { "Server-Timing": `database;dur=${(performance.now() - start).toFixed(1)}` },
-      );
+      const result = await status(env.GEOIP_LOOKUP, env.GEOIP_VERSION);
+      return json(result, 200, {
+        "Server-Timing": `database;dur=${(performance.now() - start).toFixed(1)}`,
+      });
     }
     const values = url.searchParams.getAll("ip");
     if (values.length > 1) return error("INVALID_IP", "Supply only one IP address.", 400);
@@ -81,15 +71,13 @@ async function api(
     }
     const address = parseIp(input);
     const start = performance.now();
-    const { snapshot, stale } = await getStore(env.GEOIP_DB, url.origin).get(context);
-    const ready = performance.now();
-    const result = await lookup(address, snapshot, stale);
+    const result = await lookup(address, env.GEOIP_LOOKUP, env.GEOIP_VERSION);
     return json(result, 200, {
-      "Server-Timing": `database;dur=${(ready - start).toFixed(1)}, lookup;dur=${(performance.now() - ready).toFixed(1)}`,
+      "Server-Timing": `database;dur=0.0, lookup;dur=${(performance.now() - start).toFixed(1)}`,
     });
   } catch (cause) {
     if (cause instanceof IpError) return error(cause.code, cause.message, 400);
-    if (cause instanceof DatabaseUnavailable || cause instanceof PageUnavailable) {
+    if (cause instanceof DatabaseUnavailable) {
       const response = error("DATABASE_UNAVAILABLE", new DatabaseUnavailable().message, 503);
       response.headers.set("Retry-After", "30");
       return response;
@@ -99,12 +87,12 @@ async function api(
 }
 
 export default {
-  async fetch(request: Request, env: Env, context?: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     let response: Response;
     const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
     if (isApi) {
-      response = await api(request, env, url, context);
+      response = await api(request, env, url);
       // Explicit-address queries are public. Do not expose a visitor's IP to
       // arbitrary websites via CORS; that endpoint is intentionally same-origin.
       if (url.pathname === "/api/status" || url.searchParams.has("ip")) {

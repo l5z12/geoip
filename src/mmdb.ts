@@ -5,6 +5,8 @@ export interface ByteSource {
   readonly size: number;
   /** Returned bytes may be a view of shared cached data; callers must not mutate them. */
   read(offset: number, length: number): Promise<Uint8Array>;
+  /** Create a batch scope owned by one record decode, never shared across requests. */
+  forRecord?(): ByteSource;
 }
 
 export interface MmdbMetadata {
@@ -240,11 +242,23 @@ export class AsyncMmdb {
     private dataEnd: number,
   ) {}
 
-  static async open(source: ByteSource): Promise<AsyncMmdb> {
+  static async open(source: ByteSource, searchTreeSizeHint?: number): Promise<AsyncMmdb> {
     if (!Number.isSafeInteger(source.size) || source.size < MARKER.length)
       fail("invalid database size");
     const tailStart = Math.max(0, source.size - 128 * 1024);
-    const tail = Buffer.from(await read(source, tailStart, source.size - tailStart));
+    // The manifest may supply the separator's location so it can be read in
+    // parallel with metadata. It is a hint only; validate both against the file.
+    const initial = await Promise.allSettled([
+      read(source, tailStart, source.size - tailStart),
+      searchTreeSizeHint === undefined
+        ? Promise.resolve(undefined)
+        : read(source, searchTreeSizeHint, 16),
+    ]);
+    const parts = initial.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
+    const tail = Buffer.from(parts[0]!);
     const marker = tail.lastIndexOf(MARKER);
     if (marker < 0) fail("metadata marker missing");
     const dataEnd = tailStart + marker;
@@ -281,7 +295,9 @@ export class AsyncMmdb {
     const searchTreeSize = ((nodeCount as number) * (recordSize as number)) / 4;
     if (!Number.isSafeInteger(searchTreeSize) || searchTreeSize + 16 > dataEnd)
       fail("search tree exceeds database bounds");
-    if ((await read(source, searchTreeSize, 16)).some((byte) => byte !== 0))
+    if (searchTreeSizeHint !== undefined && searchTreeSizeHint !== searchTreeSize)
+      fail("search tree size differs from manifest");
+    if ((parts[1] ?? (await read(source, searchTreeSize, 16))).some((byte) => byte !== 0))
       fail("invalid data separator");
     const metadata: MmdbMetadata = {
       databaseType: m.database_type as string,
@@ -340,11 +356,19 @@ export class AsyncMmdb {
     }
     if (node === nodeCount) return [null, prefix];
     if (node < nodeCount) fail("search path exceeds address width");
+    return [await this.record(node), prefix];
+  }
+
+  /** Decode one leaf for the offline D1 importer; node is an MMDB data pointer. */
+  async record(node: number): Promise<Record<string, unknown>> {
+    const { searchTreeSize, nodeCount } = this.metadata;
     const offset = searchTreeSize + node - nodeCount;
-    const [value] = await new Decoder(this.source, searchTreeSize + 16, this.dataEnd).decode(
-      offset,
-    );
+    const [value] = await new Decoder(
+      this.source.forRecord?.() ?? this.source,
+      searchTreeSize + 16,
+      this.dataEnd,
+    ).decode(offset);
     if (!object(value)) fail("record root is not a map");
-    return [value as Record<string, unknown>, prefix];
+    return value as Record<string, unknown>;
   }
 }

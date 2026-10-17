@@ -1,5 +1,6 @@
 # Generated output, local databases, and credentials.
 node_modules/
+.wrangler-release.json
 dist/
 .wrangler/
 .data/

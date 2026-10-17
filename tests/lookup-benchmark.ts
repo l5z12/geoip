@@ -1,70 +1,43 @@
-import { DatabaseStore, loadSnapshot, lookup } from "../src/database";
-import { PAGE_BYTES } from "../src/manifest";
-import { PageCache } from "../src/pages";
-import { dataset, fakeBucket, fakeEdgePages } from "./fixtures";
+import { DatabaseSync } from "node:sqlite";
+import { D1_SCHEMA, LOOKUP_SQL } from "../src/d1-schema";
 
-// Synthetic R2 round trips, not a prediction of production latency. Padding
-// places metadata across two pages, separate from the tree/data separator.
-const delayMs = 100;
-const data = dataset(undefined, {}, PAGE_BYTES * 3);
-const fake = fakeBucket(data, () => new Promise((resolve) => setTimeout(resolve, delayMs)));
-let now = Date.now();
-const store = new DatabaseStore(fake.bucket, () => now);
-const background: Promise<unknown>[] = [];
-const context = {
-  waitUntil(promise: Promise<unknown>) {
-    background.push(promise);
-  },
-};
-
-async function measure(name: string, operation: () => Promise<unknown>, bucket = fake) {
-  const calls = bucket.calls.length;
-  const start = performance.now();
-  await operation();
+const db = new DatabaseSync(":memory:");
+try {
+  db.exec(D1_SCHEMA);
+  db.exec("INSERT INTO metadata VALUES (1, '{}', 1); INSERT INTO records VALUES (1, '{}')");
+  const insert = db.prepare("INSERT INTO ranges VALUES (?, 4, ?, ?, 32, 1)");
+  db.exec("BEGIN");
+  for (let value = 0; value < 250_000; value++) {
+    const key = (0x08000000 + value * 2).toString(16).padStart(8, "0");
+    for (let kind = 0; kind < 3; kind++) insert.run(kind, key, key);
+  }
+  db.exec("COMMIT");
+  const query = db.prepare(LOOKUP_SQL),
+    timings: number[] = [];
+  for (let i = 0; i < 1000; i++) {
+    const key = (0x08000000 + ((i * 997) % 500_000)).toString(16).padStart(8, "0");
+    const start = performance.now();
+    query.all(4, key);
+    timings.push(performance.now() - start);
+  }
+  timings.sort((a, b) => a - b);
   console.log(
-    `${name}: ${(performance.now() - start).toFixed(1)} ms, ${bucket.calls.length - calls} R2 reads`,
+    JSON.stringify(
+      {
+        engine: "local SQLite (excludes D1 network latency)",
+        ranges: 750000,
+        distinctLookups: 1000,
+        medianMs: timings[500],
+        p95Ms: timings[950],
+        queryPlan: db
+          .prepare("EXPLAIN QUERY PLAN " + LOOKUP_SQL)
+          .all(4, "08000000")
+          .map((row) => row.detail),
+      },
+      null,
+      2,
+    ),
   );
+} finally {
+  db.close();
 }
-
-console.log(`Synthetic benchmark: ${delayMs} ms per R2 read; three paged MMDB fixtures`);
-const get = () => store.get(context);
-await measure("Cold status/database initialization", get);
-await measure("Warm IPv4 lookup", async () =>
-  lookup({ ip: "1.1.1.1", version: 4 }, (await get()).snapshot),
-);
-await measure("Warm IPv6 lookup", async () =>
-  lookup({ ip: "2606:4700:4700::1111", version: 6 }, (await get()).snapshot),
-);
-now += 300_001;
-await measure("Lookup when manifest recheck is due", async () =>
-  lookup({ ip: "1.1.1.1", version: 4 }, (await get()).snapshot),
-);
-await Promise.all(background);
-
-console.log("\nScattered record fields; in-memory edge-cache simulation (not edge latency):");
-const scattered = dataset(undefined, {}, 0, true);
-const bucket = fakeBucket(scattered, () => new Promise((resolve) => setTimeout(resolve, delayMs)));
-const { edge } = fakeEdgePages();
-function newIsolate() {
-  const cache = new PageCache(bucket.bucket, undefined, edge);
-  return new DatabaseStore(bucket.bucket, Date.now, (bucket, manifest) =>
-    loadSnapshot(bucket, manifest, cache),
-  );
-}
-let isolate = newIsolate();
-await measure(
-  "Cold IPv4 lookup with empty caches",
-  async () => lookup({ ip: "1.1.1.1", version: 4 }, (await isolate.get()).snapshot),
-  bucket,
-);
-isolate = newIsolate();
-await measure(
-  "Cold isolate reusing verified edge pages",
-  async () => lookup({ ip: "1.1.1.1", version: 4 }, (await isolate.get()).snapshot),
-  bucket,
-);
-await measure(
-  "Warm scattered IPv6 lookup",
-  async () => lookup({ ip: "2606:4700:4700::1111", version: 6 }, (await isolate.get()).snapshot),
-  bucket,
-);

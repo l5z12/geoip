@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
+import ipaddr from "ipaddr.js";
 import { sha256, versionFor } from "../scripts/shared";
 import { DATABASE_KINDS, PAGE_BYTES, type DatabaseKind, type Manifest } from "../src/manifest";
-import type { EdgePages, PageStorage } from "../src/pages";
 
 export function gate() {
   let release!: () => void;
@@ -111,6 +111,71 @@ function scatter(data: unknown): Buffer {
   return bytes;
 }
 
+export function treeMmdb(recordSize: 24 | 28 | 32, networks: string[]): Buffer {
+  type Node = [number | "empty" | "record", number | "empty" | "record"];
+  const nodes: Node[] = [["empty", "empty"]];
+  for (const network of networks) {
+    const [ip, prefix] = network.split("/");
+    const address = ipaddr.parse(ip!);
+    const bytes = address.toByteArray();
+    const bits = bytes.flatMap((byte) =>
+      Array.from({ length: 8 }, (_, i) => (byte >>> (7 - i)) & 1),
+    );
+    if (bytes.length === 4) bits.unshift(...Array<number>(96).fill(0));
+    const depth = Number(prefix) + (bytes.length === 4 ? 96 : 0);
+    let node = 0;
+    for (let i = 0; i < depth; i++) {
+      const bit = bits[i]! as 0 | 1;
+      if (i === depth - 1) {
+        nodes[node]![bit] = "record";
+        break;
+      }
+      if (nodes[node]![bit] === "empty") {
+        nodes[node]![bit] = nodes.length;
+        nodes.push(["empty", "empty"]);
+      }
+      const next = nodes[node]![bit];
+      if (typeof next !== "number") throw new Error("Overlapping fixture prefixes");
+      node = next;
+    }
+  }
+  const tree = Buffer.alloc((nodes.length * recordSize) / 4);
+  function write(offset: number, value: number, length: number) {
+    for (let i = length - 1; i >= 0; i--) {
+      tree[offset + i] = value & 255;
+      value = Math.floor(value / 256);
+    }
+  }
+  for (const [index, node] of nodes.entries()) {
+    const [left, right] = node.map((value) =>
+      value === "empty" ? nodes.length : value === "record" ? nodes.length + 16 : value,
+    ) as [number, number];
+    const offset = (index * recordSize) / 4;
+    if (recordSize === 28) {
+      write(offset, left, 3);
+      write(offset + 4, right, 3);
+      tree[offset + 3] = Math.floor(left / 0x1000000) * 16 + Math.floor(right / 0x1000000);
+    } else {
+      write(offset, left, recordSize / 8);
+      write(offset + recordSize / 8, right, recordSize / 8);
+    }
+  }
+  return Buffer.concat([
+    tree,
+    Buffer.alloc(16),
+    encode({ country: { iso_code: "US" }, arbitrary: ["中文", "O'Brien", true] }),
+    Buffer.from("abcdef4d61784d696e642e636f6d", "hex"),
+    encode({
+      node_count: nodes.length,
+      record_size: recordSize,
+      ip_version: 6,
+      database_type: "GeoLite2-Country",
+      build_epoch: Math.floor(Date.now() / 1000),
+      binary_format_major_version: 2,
+    }),
+  ]);
+}
+
 export function dataset(
   epoch = Math.floor(Date.now() / 1000),
   records: Partial<Record<DatabaseKind, unknown>> = {},
@@ -138,6 +203,7 @@ export function dataset(
             sha256(files[kind].subarray(i * PAGE_BYTES, (i + 1) * PAGE_BYTES)),
           ),
           buildEpoch: date,
+          searchTreeSize: 6,
         },
       ]),
     ) as Manifest["files"],
@@ -147,10 +213,11 @@ export function dataset(
 
 export function fakeBucket(
   data = dataset(),
-  beforeGet?: (key: string, offset?: number) => Promise<void>,
+  beforeGet?: (key: string, offset?: number, length?: number) => Promise<void>,
 ) {
   const objects = new Map<string, Buffer>();
   const calls: string[] = [];
+  const ranges: { key: string; offset?: number; length?: number }[] = [];
   function install(next: ReturnType<typeof dataset>) {
     objects.set("manifest.json", Buffer.from(JSON.stringify(next.manifest)));
     for (const kind of DATABASE_KINDS) objects.set(next.manifest.files[kind].key, next[kind]);
@@ -159,7 +226,8 @@ export function fakeBucket(
   const bucket = {
     async get(key: string, options?: { range?: { offset: number; length: number } }) {
       calls.push(key);
-      await beforeGet?.(key, options?.range?.offset);
+      ranges.push({ key, ...options?.range });
+      await beforeGet?.(key, options?.range?.offset, options?.range?.length);
       const bytes = objects.get(key);
       if (!bytes) return null;
       const range = options?.range;
@@ -181,31 +249,5 @@ export function fakeBucket(
       };
     },
   } as unknown as R2Bucket;
-  return { bucket, objects, calls, install };
-}
-
-export function fakeEdgePages() {
-  const entries = new Map<string, Response>();
-  const storage: PageStorage = {
-    async match(key) {
-      const response = entries.get(key);
-      if (!response) return undefined;
-      // Cache.match returns an independent body, not one half of a stream tee.
-      return new Response(await response.clone().arrayBuffer(), {
-        status: response.status,
-        headers: response.headers,
-      });
-    },
-    async put(key, response) {
-      entries.set(
-        key,
-        new Response(await response.arrayBuffer(), {
-          status: response.status,
-          headers: response.headers,
-        }),
-      );
-    },
-  };
-  const edge: EdgePages = { origin: "https://geoip.example", open: async () => storage };
-  return { entries, storage, edge };
+  return { bucket, objects, calls, ranges, install };
 }

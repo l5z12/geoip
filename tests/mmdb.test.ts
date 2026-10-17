@@ -294,6 +294,64 @@ function pointer(target: number): Buffer {
   return bytes;
 }
 
+test("a verified tree-size hint overlaps metadata and separator reads", async () => {
+  const input = source(mmdb("country", 1700000000, undefined, 256 * 1024));
+  const original = input.read;
+  const reads = gate();
+  const started: [number, number][] = [];
+  input.read = async (offset, length) => {
+    started.push([offset, length]);
+    await reads.promise;
+    return original(offset, length);
+  };
+  const pending = AsyncMmdb.open(input, 6);
+  try {
+    await sleep(0);
+    expect(started).toEqual([
+      [input.size - 128 * 1024, 128 * 1024],
+      [6, 16],
+    ]);
+  } finally {
+    reads.release();
+    expect((await pending).metadata.searchTreeSize).toBe(6);
+  }
+});
+
+test("wrong hints and corrupt separators cannot bypass database validation", async () => {
+  const bytes = mmdb("country", 1700000000);
+  await expect(AsyncMmdb.open(source(bytes), 7)).rejects.toThrow("differs from manifest");
+  await expect(AsyncMmdb.open(source(bytes), -1)).rejects.toThrow("bounds");
+  bytes[6] = 1;
+  await expect(AsyncMmdb.open(source(bytes), 6)).rejects.toThrow("separator");
+  await expect(AsyncMmdb.open(source(bytes))).rejects.toThrow("separator");
+});
+
+test("initialization drains a prefetched separator even when metadata fails", async () => {
+  const reads = gate();
+  let settled = false;
+  const input: ByteSource = {
+    size: 300000,
+    async read(offset, length) {
+      if (offset === 6) {
+        await reads.promise;
+        return new Uint8Array(length);
+      }
+      throw new Error("metadata storage failure");
+    },
+  };
+  const result = AsyncMmdb.open(input, 6).catch((error: unknown) => {
+    settled = true;
+    return error;
+  });
+  try {
+    await sleep(0);
+    expect(settled).toBe(false);
+  } finally {
+    reads.release();
+    expect(await result).toEqual(new Error("metadata storage failure"));
+  }
+});
+
 test("independent pointers start together and shared targets are not mistaken for cycles", async () => {
   const data = Buffer.alloc(2048);
   data.set(map({ first: pointer(512), second: pointer(1024), shared: pointer(512) }));

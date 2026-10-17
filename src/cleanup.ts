@@ -1,4 +1,4 @@
-import { readManifest } from "./database";
+import { readManifest } from "./archive";
 
 const RETENTION_MS = 29 * 24 * 60 * 60 * 1000;
 

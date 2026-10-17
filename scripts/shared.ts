@@ -12,6 +12,7 @@ export const EDITIONS = {
 } as const;
 export const sha256 = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
+export const searchTreeSize = (bytes: Buffer): number => new Reader(bytes).metadata.searchTreeSize;
 export function pageDigests(bytes: Uint8Array): string[] {
   const pages: string[] = [];
   for (let offset = 0; offset < bytes.length; offset += PAGE_BYTES)

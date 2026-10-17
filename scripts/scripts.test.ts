@@ -239,6 +239,9 @@ test("publication accepts sparse geolocation while revalidating databases, hashe
         m.files.city.pageSha256 = [];
       },
       (m) => {
+        m.files.city.searchTreeSize = 7;
+      },
+      (m) => {
         m.version = "0".repeat(64);
         for (const k of DATABASE_KINDS) m.files[k].key = `versions/${m.version}/${k}.mmdb`;
       },

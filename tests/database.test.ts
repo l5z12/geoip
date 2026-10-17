@@ -1,344 +1,124 @@
-import { Buffer } from "node:buffer";
 import { expect, test } from "vitest";
-import { setTimeout as sleep } from "node:timers/promises";
-import { AsyncMmdb } from "../src/mmdb";
-import { DATABASE_KINDS, PAGE_BYTES } from "../src/manifest";
-import { DatabaseStore, loadSnapshot, lookup } from "../src/database";
-import { MAX_DATABASE_BYTES, parseManifest } from "../src/manifest";
-import { validateDatabase } from "../scripts/shared";
-import { dataset, fakeBucket, gate, mmdb } from "./fixtures";
+import { DatabaseUnavailable, lookup, status } from "../src/database";
+import { addressKey, LOOKUP_SQL } from "../src/d1-schema";
+import { parseManifest } from "../src/manifest";
+import { parseIp } from "../src/ip";
+import { d1Fixture } from "./d1-fixture";
+import { dataset } from "./fixtures";
 
-test("synthetic MMDBs pass real reader, downloader and lookup validation", async () => {
-  const data = dataset();
-  for (const kind of DATABASE_KINDS)
-    expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
-  const { bucket } = fakeBucket(data);
-  const snapshot = await loadSnapshot(bucket, data.manifest);
-  for (const address of [
-    { ip: "8.8.8.8", version: 4 as const },
-    { ip: "2606:4700::1", version: 6 as const },
-  ]) {
-    const result = await lookup(address, snapshot);
+test("fresh and repeated dual-stack lookups each make one indexed D1 request", async () => {
+  const db = await d1Fixture();
+  for (const ip of ["1.1.1.1", "2606:4700::1111", "8.8.8.8"]) {
+    const result = await lookup(parseIp(ip), db.binding, db.data.manifest.version);
     expect(result.country?.code).toBe("US");
     expect(result.asn?.number).toBe(13335);
-    expect(result.database.sources[0]?.name).toContain("MaxMind");
+    expect(result.records.city?.future_field).toEqual({ retained: true });
+    expect(result.records.city?.traits).toEqual({ is_anycast: true });
+    expect(result.network.city).toBe(ip.includes(":") ? "::/1" : "0.0.0.0/0");
   }
-  const full = await lookup({ ip: "8.8.8.8", version: 4 }, snapshot);
-  expect(full.records.city?.future_field).toEqual({ retained: true });
-  expect(full.records.city?.traits).toEqual({ is_anycast: true });
-  expect(full.records.city?.city).toEqual({
-    geoname_id: 42,
-    names: { en: "Test City", fr: "Ville test" },
-  });
-  async function reader(kind: "country" | "asn", value: unknown) {
-    const data = mmdb(kind, undefined, value);
-    return AsyncMmdb.open({
-      size: data.length,
-      read: async (offset, length) => data.subarray(offset, offset + length),
-    });
-  }
-  snapshot.readers.country = await reader("country", { registered_country: { iso_code: "US" } });
-  snapshot.readers.asn = await reader("asn", {});
-  const missing = await lookup({ ip: "8.8.8.8", version: 4 }, snapshot);
-  expect(missing.country).toBeNull();
-  expect(missing.asn).toBeNull();
-  expect(missing.records.country).toEqual({ registered_country: { iso_code: "US" } });
+  expect(db.calls).toHaveLength(3);
+  expect(db.calls.every((call) => call.constraint === "first-unconstrained")).toBe(true);
+  const plan = db.sql.prepare("EXPLAIN QUERY PLAN " + LOOKUP_SQL).all(4, addressKey("1.1.1.1"));
+  const details = plan.map((row) => String(row.detail)).join("\n");
+  expect(details.match(/SEARCH ranges USING PRIMARY KEY/g)).toHaveLength(3);
+  expect(details).not.toContain("SCAN ranges");
+  expect(details).not.toContain("USE TEMP B-TREE");
 });
 
-test("sparse anycast-style records validate and remain location-unknown at runtime", async () => {
-  for (const record of [
-    {},
-    { registered_country: { iso_code: "US" } },
-    { traits: { is_anycast: true } },
-  ]) {
-    const data = dataset(undefined, { country: record, city: record });
-    for (const kind of DATABASE_KINDS)
-      expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
-    const snapshot = await loadSnapshot(fakeBucket(data).bucket, data.manifest);
-    for (const address of [
-      { ip: "1.1.1.1", version: 4 as const },
-      { ip: "2606:4700:4700::1111", version: 6 as const },
-    ]) {
-      const result = await lookup(address, snapshot);
-      expect(result.country).toBeNull();
-      expect(result.records.country).toEqual(record);
-      expect(result.records.city).toEqual(record);
-      expect(result.asn?.number).toBe(13335);
-    }
-  }
-});
-
-test("manifests reject invalid keys, schemas and excessive memory", () => {
-  const good = dataset().manifest;
-  expect(parseManifest(good)).toEqual(good);
-  for (const change of [
-    { schemaVersion: 3 },
-    { version: "../bad" },
-    { updatedAt: "yesterday" },
-    { files: { ...good.files, country: { ...good.files.country, key: "manifest.json" } } },
-    { files: { ...good.files, country: { ...good.files.country, bytes: MAX_DATABASE_BYTES } } },
+test("IPv4/IPv6 predecessor seeks check the end and preserve gaps and exact boundaries", async () => {
+  const db = await d1Fixture();
+  db.sql.exec("DELETE FROM ranges");
+  const record = db.sql.prepare("SELECT id FROM records ORDER BY id LIMIT 1").get()!.id;
+  const insert = db.sql.prepare("INSERT INTO ranges VALUES (0, ?, ?, ?, ?, ?)");
+  insert.run(4, addressKey("8.8.8.0"), addressKey("8.8.8.255"), 24, record!);
+  insert.run(4, addressKey("9.9.9.9"), addressKey("9.9.9.9"), 32, record!);
+  insert.run(6, addressKey("2606:4700::"), addressKey("2606:4700::ffff"), 112, record!);
+  insert.run(6, addressKey("2606:4700:0:1::"), addressKey("2606:4700:0:1::"), 128, record!);
+  for (const ip of [
+    "8.8.8.0",
+    "8.8.8.255",
+    "9.9.9.9",
+    "2606:4700::",
+    "2606:4700::ffff",
+    "2606:4700:0:1::",
   ])
-    expect(() => parseManifest({ ...good, ...change })).toThrow();
-});
-
-test("concurrent requests share one load, cached reads do not hit R2", async () => {
-  const fake = fakeBucket();
-  const store = new DatabaseStore(fake.bucket);
-  const results = await Promise.all(Array.from({ length: 20 }, () => store.get()));
-  expect(new Set(results.map((r) => r.snapshot)).size).toBe(1);
-  expect(fake.calls.length).toBe(4);
-  await store.get();
-  expect(fake.calls.length).toBe(4);
-});
-
-test("cold initialization overlaps metadata reads across all three databases", async () => {
-  const reads = gate();
-  const data = dataset(undefined, {}, PAGE_BYTES * 3);
-  const fake = fakeBucket(data, () => reads.promise);
-  const pending = loadSnapshot(fake.bucket, data.manifest);
-  try {
-    await sleep(0);
-    // Each metadata tail straddles two pages; all six requests must start
-    // before any completes, rather than six sequential storage round trips.
-    expect(fake.calls).toHaveLength(6);
-    for (const kind of DATABASE_KINDS)
-      expect(fake.calls.filter((key) => key === data.manifest.files[kind].key)).toHaveLength(2);
-  } finally {
-    reads.release();
-    await pending;
-  }
-});
-
-test("scattered records preserve the full result while overlapping independent page reads", async () => {
-  const reads = gate();
-  const data = dataset(undefined, {}, 0, true);
-  const started: number[] = [];
-  let hold = false;
-  const fake = fakeBucket(data, async (key, offset) => {
-    if (hold && key === data.manifest.files.city.key && offset !== undefined) {
-      started.push(offset);
-      await reads.promise;
-    }
-  });
-  const snapshot = await loadSnapshot(fake.bucket, data.manifest);
-  const inline = dataset();
-  const expected = await loadSnapshot(fakeBucket(inline).bucket, inline.manifest);
-  hold = true;
-  const result = lookup({ ip: "1.1.1.1", version: 4 }, snapshot);
-  try {
-    await sleep(0);
-    // The last field's page was warmed by the metadata tail; the other six
-    // city field pages must start while all their responses are held back.
-    expect(started.length).toBeGreaterThanOrEqual(6);
-  } finally {
-    reads.release();
-    expect((await result).records).toEqual(
-      (await lookup({ ip: "1.1.1.1", version: 4 }, expected)).records,
-    );
-  }
-});
-
-test("a failing dataset lookup drains the other readers before rejecting", async () => {
-  const data = dataset();
-  const snapshot = await loadSnapshot(fakeBucket(data).bucket, data.manifest);
-  const slow = gate();
-  snapshot.readers.country.getWithPrefixLength = async () => {
-    throw new Error("country failed");
-  };
-  snapshot.readers.city.getWithPrefixLength = async () => {
-    await slow.promise;
-    return [null, 0];
-  };
-  let settled = false;
-  const result = lookup({ ip: "1.1.1.1", version: 4 }, snapshot).catch((error: unknown) => {
-    settled = true;
-    return error;
-  });
-  try {
-    await sleep(0);
-    expect(settled).toBe(false);
-  } finally {
-    slow.release();
-    expect(await result).toEqual(new Error("country failed"));
-  }
-});
-
-test("warm requests serve a validated snapshot while one background refresh switches generations", async () => {
-  let now = Math.floor(Date.now() / 1000) * 1000;
-  const old = dataset(now / 1000 - 3600);
-  const refresh = gate();
-  let hold = false;
-  const fake = fakeBucket(old, async () => {
-    if (hold) await refresh.promise;
-  });
-  const store = new DatabaseStore(fake.bucket, () => now);
-  const first = await store.get();
-  const next = dataset(now / 1000);
-  fake.install(next);
-  hold = true;
-  now += 300_001;
-  const background: Promise<unknown>[] = [];
-  const context = {
-    waitUntil(promise: Promise<unknown>) {
-      background.push(promise);
-    },
-  };
-  try {
-    const response = await store.get(context);
-    expect(response.snapshot).toBe(first.snapshot);
-    expect(response.stale).toBe(false);
-    expect((await store.get(context)).snapshot).toBe(first.snapshot);
-    expect(background).toHaveLength(2);
-    expect(background[0]).toBe(background[1]);
-    expect(fake.calls.filter((key) => key === "manifest.json")).toHaveLength(2);
-  } finally {
-    refresh.release();
-    await Promise.all(background);
-  }
-  expect((await store.get(context)).snapshot.manifest.version).toBe(next.manifest.version);
-});
-
-test("background refresh failure reports stale, throttles retries and recovers", async () => {
-  let now = Date.now();
-  const fake = fakeBucket();
-  const store = new DatabaseStore(fake.bucket, () => now);
-  const first = await store.get();
-  fake.objects.delete("manifest.json");
-  now += 300_001;
-  const background: Promise<unknown>[] = [];
-  const context = {
-    waitUntil(promise: Promise<unknown>) {
-      background.push(promise);
-    },
-  };
-  expect((await store.get(context)).snapshot).toBe(first.snapshot);
-  await Promise.all(background);
-  const calls = fake.calls.length;
-  expect((await store.get(context)).stale).toBe(true);
-  expect(fake.calls).toHaveLength(calls);
-  fake.install(dataset());
-  now += 30_001;
-  await store.get(context);
-  await Promise.all(background);
-  expect((await store.get(context)).stale).toBe(false);
-});
-
-test("cold requests with a context still wait for validation", async () => {
-  const reads = gate();
-  const fake = fakeBucket(undefined, () => reads.promise);
-  const store = new DatabaseStore(fake.bucket);
-  const background: Promise<unknown>[] = [];
-  let returned = false;
-  const pending = store
-    .get({
-      waitUntil(promise) {
-        background.push(promise);
-      },
-    })
-    .then((result) => {
-      returned = true;
-      return result;
+    expect((await lookup(parseIp(ip), db.binding)).country?.code).toBe("US");
+  for (const ip of [
+    "1.1.1.1",
+    "8.8.9.0",
+    "9.9.9.10",
+    "2606:46ff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "2606:4700::1:0",
+    "2606:4700:0:1::1",
+  ])
+    expect((await lookup(parseIp(ip), db.binding)).records).toEqual({
+      country: null,
+      city: null,
+      asn: null,
     });
-  try {
-    await sleep(0);
-    expect(returned).toBe(false);
-    expect(background).toHaveLength(0);
-  } finally {
-    reads.release();
-    await pending;
-  }
 });
 
-test("an expiring snapshot cannot bypass an already pending background refresh", async () => {
-  let now = Math.floor(Date.now() / 1000) * 1000;
-  const old = dataset(now / 1000 - 30 * 86400 + 600);
-  const refresh = gate();
-  let hold = false;
-  const fake = fakeBucket(old, async () => {
-    if (hold) await refresh.promise;
+test("sparse records retain unknown location and arbitrary original fields", async () => {
+  const data = dataset(undefined, {
+    country: { registered_country: { iso_code: "US" } },
+    city: { traits: { is_anycast: true } },
+    asn: {},
   });
-  const store = new DatabaseStore(fake.bucket, () => now);
-  await store.get();
-  now += 300_001;
-  hold = true;
-  const background: Promise<unknown>[] = [];
-  const context = {
-    waitUntil(promise: Promise<unknown>) {
-      background.push(promise);
-    },
-  };
-  await store.get(context);
-  now += 300_001;
-  let returned = false;
-  const expired = store.get(context).then(
-    () => {
-      returned = true;
-    },
-    () => {
-      returned = true;
-    },
-  );
-  try {
-    await sleep(0);
-    expect(returned).toBe(false);
-    expect(background).toHaveLength(1);
-  } finally {
-    refresh.release();
-    await Promise.all([...background, expired]);
+  const db = await d1Fixture(data);
+  const result = await lookup(parseIp("1.1.1.1"), db.binding);
+  expect(result.country).toBeNull();
+  expect(result.asn).toBeNull();
+  expect(result.records.country).toEqual({ registered_country: { iso_code: "US" } });
+  expect(result.records.city).toEqual({ traits: { is_anycast: true } });
+});
+
+test("lagging or unavailable replicas retry the primary without serving an old slot", async () => {
+  for (const failure of ["stale", "fail"] as const) {
+    const db = await d1Fixture();
+    db.replica[failure] = true;
+    const result = await lookup(parseIp("1.1.1.1"), db.binding, db.data.manifest.version);
+    expect(result.database.version).toBe(db.data.manifest.version);
+    expect(db.calls.map((call) => call.constraint)).toEqual([
+      "first-unconstrained",
+      "first-primary",
+    ]);
   }
-  await expect(store.get(context)).rejects.toThrow("not available");
 });
 
-test("bad refresh keeps old pair, throttles retries, then atomically switches both", async () => {
-  let now = Math.floor(Date.now() / 1000) * 1000;
-  const old = dataset(now / 1000 - 3600);
-  const fake = fakeBucket(old);
-  const store = new DatabaseStore(fake.bucket, () => now);
-  expect((await store.get()).snapshot.manifest.version).toBe(old.manifest.version);
-  const next = dataset(now / 1000);
-  fake.install(next);
-  fake.objects.set(next.manifest.files.asn.key, Buffer.alloc(next.asn.length));
-  now += 300001;
-  const stale = await store.get();
-  expect(stale.stale).toBe(true);
-  expect(stale.snapshot.manifest.version).toBe(old.manifest.version);
-  const calls = fake.calls.length;
-  await store.get();
-  expect(fake.calls.length).toBe(calls);
-  fake.install(next);
-  now += 30001;
-  const fresh = await store.get();
-  expect(fresh.stale).toBe(false);
-  expect(fresh.snapshot.manifest.version).toBe(next.manifest.version);
-});
-
-test("cold failures return unavailable and recover after retry interval", async () => {
-  let now = Date.now();
-  const fake = fakeBucket();
-  fake.objects.delete("manifest.json");
-  const store = new DatabaseStore(fake.bucket, () => now);
-  await expect(store.get()).rejects.toThrow("not available");
-  fake.install(dataset());
-  await expect(store.get()).rejects.toThrow("not available");
-  expect(fake.calls.length).toBe(1);
-  now += 30001;
-  expect((await store.get()).stale).toBe(false);
-});
-
-test("checksum, truncation, metadata and expiry are enforced", async () => {
-  const data = dataset();
-  const fake = fakeBucket(data);
-  fake.objects.set(data.manifest.files.country.key, Buffer.alloc(data.country.length));
-  await expect(loadSnapshot(fake.bucket, data.manifest)).rejects.toThrow("integrity");
-  fake.objects.set(data.manifest.files.country.key, Buffer.alloc(3));
-  await expect(loadSnapshot(fake.bucket, data.manifest)).rejects.toThrow("integrity");
-  fake.install(data);
-  const mismatch = structuredClone(data.manifest);
-  mismatch.files.country.buildEpoch = "2000-01-01T00:00:00.000Z";
-  await expect(loadSnapshot(fake.bucket, mismatch)).rejects.toThrow("metadata");
-  const expired = dataset(Math.floor(Date.now() / 1000) - 31 * 86400);
-  expect(() => validateDatabase("country", expired.country)).toThrow("freshness");
-  await expect(new DatabaseStore(fakeBucket(expired).bucket).get()).rejects.toThrow(
-    "not available",
+test("missing, unready, expired, mismatched and malformed releases fail closed", async () => {
+  for (const mutation of [
+    "DELETE FROM metadata",
+    "UPDATE metadata SET ready = 0",
+    "UPDATE metadata SET data = '{}'",
+    "UPDATE metadata SET data = 'broken'",
+  ]) {
+    const db = await d1Fixture();
+    db.sql.exec(mutation);
+    await expect(lookup(parseIp("1.1.1.1"), db.binding)).rejects.toBeInstanceOf(
+      DatabaseUnavailable,
+    );
+    await expect(status(db.binding)).rejects.toBeInstanceOf(DatabaseUnavailable);
+  }
+  const old = await d1Fixture(dataset(Math.floor(Date.now() / 1000) - 31 * 86400));
+  await expect(status(old.binding)).rejects.toBeInstanceOf(DatabaseUnavailable);
+  const future = await d1Fixture(dataset(Math.floor(Date.now() / 1000) + 3 * 86400));
+  await expect(status(future.binding)).rejects.toBeInstanceOf(DatabaseUnavailable);
+  const db = await d1Fixture();
+  await expect(lookup(parseIp("1.1.1.1"), db.binding, "b".repeat(64))).rejects.toBeInstanceOf(
+    DatabaseUnavailable,
   );
+});
+
+test("archive manifests reject invalid schema, keys and sizes", () => {
+  const { manifest } = dataset();
+  expect(parseManifest(manifest)).toEqual(manifest);
+  expect(() => parseManifest({ ...manifest, schemaVersion: 1 })).toThrow();
+  for (const changes of [{ key: "wrong" }, { bytes: -1 }, { searchTreeSize: 1e9 }]) {
+    expect(() =>
+      parseManifest({
+        ...manifest,
+        files: { ...manifest.files, city: { ...manifest.files.city, ...changes } },
+      }),
+    ).toThrow();
+  }
 });

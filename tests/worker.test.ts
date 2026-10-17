@@ -1,10 +1,12 @@
 import { expect, test } from "vitest";
 import worker, { type Env } from "../src/index";
 import { fakeBucket } from "./fixtures";
+import { d1Fixture } from "./d1-fixture";
 
-function environment(): Env {
+async function environment(): Promise<Env> {
   return {
     GEOIP_DB: fakeBucket().bucket,
+    GEOIP_LOOKUP: (await d1Fixture()).binding,
     ASSETS: {
       fetch: async () => new Response("static page", { headers: { "Content-Type": "text/html" } }),
     } as unknown as Fetcher,
@@ -13,7 +15,7 @@ function environment(): Env {
 const req = (path: string, init?: RequestInit) => new Request(`https://geoip.example${path}`, init);
 
 test("explicit dual-stack lookups return JSON with CORS and no shared caching", async () => {
-  const env = environment();
+  const env = await environment();
   for (const ip of ["1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"]) {
     const response = await worker.fetch(req(`/api/lookup?ip=${encodeURIComponent(ip)}`), env);
     expect(response.status).toBe(200);
@@ -28,7 +30,7 @@ test("explicit dual-stack lookups return JSON with CORS and no shared caching", 
 });
 
 test("caller IP trusts edge headers only and is not exposed through CORS", async () => {
-  const env = environment();
+  const env = await environment();
   const response = await worker.fetch(
     req("/api/lookup", {
       headers: {
@@ -55,15 +57,17 @@ test("caller IP trusts edge headers only and is not exposed through CORS", async
 
 test("empty, repeated, invalid and nonpublic query values return 400 before loading data", async () => {
   const fake = fakeBucket();
-  const env = { ...environment(), GEOIP_DB: fake.bucket };
+  const d1 = await d1Fixture();
+  const env = { ...(await environment()), GEOIP_DB: fake.bucket, GEOIP_LOOKUP: d1.binding };
   for (const query of ["ip=", "ip=1.1.1.1&ip=8.8.8.8", "ip=hostname", "ip=127.0.0.1"]) {
     expect((await worker.fetch(req(`/api/lookup?${query}`), env)).status).toBe(400);
   }
   expect(fake.calls).toHaveLength(0);
+  expect(d1.calls).toHaveLength(0);
 });
 
 test("status, HEAD, OPTIONS, unsupported methods and unknown endpoints", async () => {
-  const env = environment();
+  const env = await environment();
   const status = await worker.fetch(req("/api/status"), env);
   expect(status.headers.get("Server-Timing")).toMatch(/^database;dur=\d+\.\d$/);
   expect(((await status.json()) as { status: string }).status).toBe("ok");
@@ -82,7 +86,9 @@ test("status, HEAD, OPTIONS, unsupported methods and unknown endpoints", async (
 test("missing databases are a retryable 503; static pages remain available", async () => {
   const fake = fakeBucket();
   fake.objects.clear();
-  const env = { ...environment(), GEOIP_DB: fake.bucket };
+  const d1 = await d1Fixture();
+  d1.sql.exec("DELETE FROM metadata");
+  const env = { ...(await environment()), GEOIP_DB: fake.bucket, GEOIP_LOOKUP: d1.binding };
   const response = await worker.fetch(req("/api/lookup?ip=1.1.1.1"), env);
   expect(response.status).toBe(503);
   expect(response.headers.get("Retry-After")).toBe("30");
