@@ -1,0 +1,5 @@
+# Native binaries used by the TypeScript runner and Cloudflare tooling.
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true

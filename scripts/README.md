@@ -1,10 +1,10 @@
 # Database operations
 
-Requires Bun 1.3.14. Run commands from the repository root.
+Requires Node.js 24 (at least 24.10.0) and pnpm 10.34.7. Run commands from the repository root. Database scripts load `.env` when present; variables already supplied by the environment take precedence.
 
-- `bun run infra:ensure`: confirm/create the configured `GEOIP_DB` R2 bucket.
-- `bun run db:update`: download official GeoLite2 Country, City and ASN archives, validate, then publish to remote R2.
-- `bun run db:local`: download and publish into Wrangler's local R2 storage.
+- `pnpm run infra:ensure`: confirm/create the configured `GEOIP_DB` R2 bucket.
+- `pnpm run db:update`: download official GeoLite2 Country, City and ASN archives, validate, then publish to remote R2.
+- `pnpm run db:local`: download and publish into Wrangler's local R2 storage.
 
 Download requires `MAXMIND_ACCOUNT_ID` and `MAXMIND_LICENSE_KEY` with GeoLite2 download entitlement. Remote operations require `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`; no S3 credentials are used. Put all four in GitHub's protected `production` environment. CI never downloads databases or receives secrets. Do not commit `.data`, credentials, or database archives.
 

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import worker, { type Env } from "../src/index";
 import { fakeBucket } from "./fixtures";
 

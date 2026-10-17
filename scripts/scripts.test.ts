@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, vi, test } from "vitest";
 import { Reader } from "mmdb-lib";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { extractArchive, MAX_ARCHIVE_BYTES, MAX_EXPANDED_BYTES } from "./download-databases";
 import { ensureBucket } from "./ensure-bucket";
-import { publicationPlan, publishMode, validateLocal } from "./publish-databases";
+import { publicationPlan, publishMode, runWrangler, validateLocal } from "./publish-databases";
 import { EDITIONS, pageDigests, sha256, validateDatabase, versionFor } from "./shared";
 import { DATABASE_KINDS, PAGE_BYTES, type Manifest } from "../src/manifest";
 import { dataset, mmdb } from "../tests/fixtures";
@@ -146,7 +146,7 @@ test("optional geolocation does not relax edition, freshness or ASN checks", () 
 });
 
 test("lookup errors still fail with probe context and without dependency error text", () => {
-  const probe = spyOn(Reader.prototype, "get").mockImplementation(() => { throw new Error("secret signed URL"); });
+  const probe = vi.spyOn(Reader.prototype, "get").mockImplementation(() => { throw new Error("secret signed URL"); });
   try {
     expect(() => validateDatabase("country", mmdb("country"))).toThrow(/^country MMDB failed record lookup for 1\.1\.1\.1: parser\/lookup error \(details suppressed\)$/);
   } finally { probe.mockRestore(); }
@@ -207,6 +207,12 @@ test("publication commits immutable manifest before active pointer", () => {
   expect(publishMode([])).toBe("--remote");
   expect(publishMode(["--local"])).toBe("--local");
   expect(() => publishMode(["--local", "--remote"])).toThrow();
+});
+
+test("publisher can launch the installed Wrangler CLI through Node", async () => {
+  expect(await runWrangler(["--version"])).toBe(true);
+  // Missing the required object path is a local argument error; no upload runs.
+  expect(await runWrangler(["r2", "object", "put"])).toBe(false);
 });
 
 describe("Cloudflare bucket ensure", () => {

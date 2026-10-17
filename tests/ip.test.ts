@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { networkCidr, parseIp } from "../src/ip";
 
 test("normalizes strict IPv4, IPv6 and mapped IPv4", () => {

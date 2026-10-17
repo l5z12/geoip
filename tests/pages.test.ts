@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
+import { setTimeout as sleep } from "node:timers/promises";
 import { PAGE_BYTES, type DatabaseFile } from "../src/manifest";
 import { PageCache } from "../src/pages";
 import { sha256 } from "../scripts/shared";
@@ -38,7 +39,7 @@ test("a boundary-spanning read starts both page downloads before either finishes
   const f = fixture(2, () => reads.promise);
   const pending = new PageCache(f.bucket).source(f.file).read(PAGE_BYTES - 2, 4);
   try {
-    await Bun.sleep(0);
+    await sleep(0);
     expect(f.calls).toHaveLength(2);
   } finally {
     reads.release();
@@ -52,7 +53,7 @@ test("parallel page reads retain the shared eight-download limit", async () => {
   const cache = new PageCache(f.bucket, PAGE_BYTES * 2);
   const pending = Promise.all(Array.from({ length: 12 }, (_, index) => cache.page(f.file, index)));
   try {
-    await Bun.sleep(0);
+    await sleep(0);
     expect(f.calls).toHaveLength(8);
   } finally {
     reads.release();

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { cleanupDatabases } from "../src/cleanup";
 import { dataset, fakeBucket } from "./fixtures";
 

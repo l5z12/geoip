@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
+import { setTimeout as sleep } from "node:timers/promises";
 import { AsyncMmdb } from "../src/mmdb";
 import { DATABASE_KINDS, PAGE_BYTES } from "../src/manifest";
 import { DatabaseStore, loadSnapshot, lookup } from "../src/database";
@@ -75,7 +76,7 @@ test("cold initialization overlaps metadata reads across all three databases", a
   const fake = fakeBucket(data, () => reads.promise);
   const pending = loadSnapshot(fake.bucket, data.manifest);
   try {
-    await Bun.sleep(0);
+    await sleep(0);
     // Each metadata tail straddles two pages; all six requests must start
     // before any completes, rather than six sequential storage round trips.
     expect(fake.calls).toHaveLength(6);
@@ -147,7 +148,7 @@ test("cold requests with a context still wait for validation", async () => {
     return result;
   });
   try {
-    await Bun.sleep(0);
+    await sleep(0);
     expect(returned).toBe(false);
     expect(background).toHaveLength(0);
   } finally {
@@ -173,7 +174,7 @@ test("an expiring snapshot cannot bypass an already pending background refresh",
   let returned = false;
   const expired = store.get(context).then(() => { returned = true; }, () => { returned = true; });
   try {
-    await Bun.sleep(0);
+    await sleep(0);
     expect(returned).toBe(false);
     expect(background).toHaveLength(1);
   } finally {

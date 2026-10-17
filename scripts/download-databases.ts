@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { gunzipSync } from "node:zlib";
+import { setTimeout as sleep } from "node:timers/promises";
 import { DATABASE_KINDS, MAX_DATABASE_BYTES, MAX_MANIFEST_BYTES, parseManifest, type DatabaseKind, type Manifest } from "../src/manifest";
 import { credentials, DATA_DIR, EDITIONS, pageDigests, runMain, SafeError, sha256, validateDatabase, versionFor } from "./shared";
 
@@ -101,7 +102,7 @@ export async function downloadArchive(kind: DatabaseKind, authorization: string)
       console.warn(`[${kind}] Download attempt ${attempt + 1}/3 failed: ${failure}${attempt < 2 ? `; retrying in ${1000 * 2 ** attempt} ms` : ""}`);
       if (attempt === 2) throw new SafeError(`Unable to download ${EDITIONS[kind]} after three bounded attempts: ${failure}`);
     } finally { clearTimeout(timer); }
-    await Bun.sleep(1000 * 2 ** attempt);
+    await sleep(1000 * 2 ** attempt);
   }
   throw new SafeError("Download failed");
 }

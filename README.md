@@ -1,6 +1,6 @@
 # GeoIP
 
-Cloudflare Worker for public IPv4/IPv6 lookups using **GeoLite2 City, Country, and ASN, with complete MaxMind records**. Uses Bun, MaxMind GeoLite2 databases downloaded **directly from MaxMind**, and private R2 storage. No mirrored data or external lookup service. The interface follows `d:\l5z12\l5z12`: a narrow document layout, monospace headings, quiet rules, and persistent Auto / Light / Dark themes.
+Cloudflare Worker for public IPv4/IPv6 lookups using **GeoLite2 City, Country, and ASN, with complete MaxMind records**. Uses Node.js and pnpm, MaxMind GeoLite2 databases downloaded **directly from MaxMind**, and private R2 storage. No mirrored data or external lookup service. The interface follows `d:\l5z12\l5z12`: a narrow document layout, monospace headings, quiet rules, and persistent Auto / Light / Dark themes.
 
 ## Deploy with GitHub Actions
 
@@ -24,7 +24,7 @@ The bucket is dedicated to this application and should remain private: **do not 
 
 ### Automation
 
-- **CI**: every push and pull request; frozen Bun install, typecheck, unit tests, bundle, and real `workerd` smoke test. No credentials or MaxMind downloads required.
+- **CI**: every push and pull request; frozen pnpm install, typecheck, unit tests, bundle, and real `workerd` smoke test. No credentials or MaxMind downloads required.
 - **Deploy**: pushes to `main` and manual dispatch; validates, provisions, publishes databases, then deploys.
 - **Update databases**: daily at **04:23 UTC**, or manual dispatch; downloads directly from MaxMind and updates R2 without redeploying the Worker. Daily checks do not imply MaxMind publishes a new release daily.
 - Deploy/update workflows share a non-cancelling concurrency group. Ensure the `production` environment permits unattended scheduled jobs. GitHub schedules can be delayed and public-repository schedules can be disabled after inactivity; monitor failed/missing runs and re-enable them if needed.
@@ -33,27 +33,27 @@ The bucket is dedicated to this application and should remain private: **do not 
 ## Local development
 
 ```sh
-bun install --frozen-lockfile
+pnpm install --frozen-lockfile
 cp .env.example .env
 # Fill in MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY in .env.
-bun run db:local
-bun run dev
+pnpm run db:local
+pnpm run dev
 ```
 
 Open `http://localhost:8787`. `db:local` downloads real MaxMind data, validates it, and publishes to Wrangler's **local** R2 emulator. Cloudflare credentials are not needed for this mode. Without databases the page still loads and the API returns a clear `503`. Caller-IP lookup may not be available locally; enter a public IP explicitly.
 
 ```sh
-bun run check          # strict TypeScript
-bun test               # deterministic unit tests; synthetic MMDB fixtures
-bun run test:runtime   # bundle + real workerd/R2 lookup smoke test
-bun run bench:lookup   # synthetic storage-latency benchmark (no network or credentials)
-bun run db:download    # MaxMind -> .data/, validate all three databases
-bun run db:publish     # .data/ -> remote R2 (Cloudflare credentials required)
-bun run infra:ensure   # create/verify remote bucket
-bun run deploy         # deploy code/assets only; publish databases first
+pnpm run check          # strict TypeScript
+pnpm test               # deterministic unit tests; synthetic MMDB fixtures
+pnpm run test:runtime   # bundle + real workerd/R2 lookup smoke test
+pnpm run bench:lookup   # synthetic storage-latency benchmark (no network or credentials)
+pnpm run db:download    # MaxMind -> .data/, validate all three databases
+pnpm run db:publish     # .data/ -> remote R2 (Cloudflare credentials required)
+pnpm run infra:ensure   # create/verify remote bucket
+pnpm run deploy         # deploy code/assets only; publish databases first
 ```
 
-Bun is pinned to **1.3.14** in `package.json` and workflows. `.env`, `.data`, local R2 state, database archives, and MMDBs are ignored by Git. No database artifacts are uploaded to GitHub. Local `.data/licenses/` retains notices provided by MaxMind archives.
+Use **Node.js 24** (at least 24.10.0) and **pnpm 10.34.7**. The pnpm version is pinned in `package.json`; workflows use `.node-version` and `pnpm-lock.yaml`. Tests use Vitest; TypeScript scripts run on Node.js with tsx. Database scripts load `.env` when present, with existing environment variables taking precedence. `.env`, `.data`, local R2 state, database archives, and MMDBs are ignored by Git. No database artifacts are uploaded to GitHub. Local `.data/licenses/` retains notices provided by MaxMind archives.
 
 ## API
 
@@ -85,7 +85,7 @@ MMDBs are **not bundled with the Worker or loaded whole into memory**. A paged M
 
 The active manifest is checked at most every five minutes per isolate; concurrent loads are coalesced. Once a validated, unexpired snapshot is available, requests serve it immediately while the check runs through [`ctx.waitUntil()`](https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil). New generations become active only after all three readers pass validation. Cold requests and requests whose snapshot has expired wait for validation; expired data is never served. `database.stale` reflects the last completed refresh. Cold lookups can still require multiple dependent R2 range reads; warm paths reuse cached pages. Use the Workers paid plan for CPU/subrequest headroom and benchmark latency/cost for your traffic.
 
-`bun run bench:lookup` measures cold initialization, warm IPv4/IPv6 lookups, and a lookup during a scheduled refresh using synthetic multi-page MMDBs and a fixed 100 ms delay per storage read. It needs no credentials or licensed data. Its timings compare code paths under controlled latency; they are not production latency predictions.
+`pnpm run bench:lookup` measures cold initialization, warm IPv4/IPv6 lookups, and a lookup during a scheduled refresh using synthetic multi-page MMDBs and a fixed 100 ms delay per storage read. It needs no credentials or licensed data. Its timings compare code paths under controlled latency; they are not production latency predictions.
 
 Each update validates tar/gzip size bounds, archive structure, MMDB type, dual-stack sample records, and build freshness. Country/City probes allow missing geolocation (including for anycast IPs) and validate field types and coordinate ranges when present; missing geography is not database corruption. It calculates whole-file and per-page SHA-256 hashes, uploads a content-addressed generation under `versions/<sha256>/`, followed by an immutable version manifest, and **writes `manifest.json` last**. A failed pre-publication update leaves the old active pointer untouched. Worker refresh failures preserve the previous working generation and set `database.stale`; retries are throttled to 30 seconds. Data more than 30 days old is not served. Combined stored MMDB size is capped at 512 MiB; this is a storage/download safety bound, not a Worker memory allocation. Corrupt or unavailable pages return a retryable `503`.
 
@@ -98,9 +98,9 @@ No application IP logging, analytics, or third-party browser requests are implem
 Redeploy an earlier Worker commit for code rollback. For data rollback, while the desired validated generation remains in R2 and all builds are under 30 days old:
 
 ```sh
-bun x wrangler r2 object get geoip-databases/versions/VERSION/manifest.json --file .data/rollback.json --remote
+pnpm exec wrangler r2 object get geoip-databases/versions/VERSION/manifest.json --file .data/rollback.json --remote
 # Inspect the manifest; confirm all three referenced MMDB objects still exist.
-bun x wrangler r2 object put geoip-databases/manifest.json --file .data/rollback.json --remote
+pnpm exec wrangler r2 object put geoip-databases/manifest.json --file .data/rollback.json --remote
 ```
 
 Coordinate manual rollback with update jobs and the cleanup cron. Active isolates observe the pointer within five minutes. Do not commit rollback manifests containing licensed data; local artifacts remain ignored.

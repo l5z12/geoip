@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { Buffer } from "node:buffer";
 import { AsyncMmdb, type ByteSource } from "../src/mmdb";
 import { mmdb } from "./fixtures";

@@ -1,10 +1,12 @@
 import { readFile, stat } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DATABASE_KINDS, MAX_MANIFEST_BYTES, parseManifest, type DatabaseKind, type Manifest } from "../src/manifest";
 import { bucketName, credentials, DATA_DIR, pageDigests, runMain, SafeError, sha256, validateDatabase, versionFor } from "./shared";
 
 export function publishMode(args: string[]): "--local" | "--remote" {
-  if (args.length > 1 || (args.length === 1 && args[0] !== "--local" && args[0] !== "--remote")) throw new SafeError("Usage: bun scripts/publish-databases.ts [--local|--remote]");
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--local" && args[0] !== "--remote")) throw new SafeError("Usage: pnpm run db:publish [--local|--remote]");
   return args[0] === "--local" ? "--local" : "--remote";
 }
 export async function validateLocal(dataDir = DATA_DIR): Promise<Manifest> {
@@ -34,16 +36,29 @@ export function publicationPlan(manifest: Manifest): { key: string; file: string
     { key: "manifest.json", file: "manifest.json" },
   ];
 }
+export async function runWrangler(args: string[]): Promise<boolean> {
+  // Launch the installed CLI with Node directly: no shell or platform-specific
+  // pnpm shim, and paths/arguments containing spaces stay intact on Windows.
+  const require = createRequire(import.meta.url);
+  const packageUrl = pathToFileURL(require.resolve("wrangler/package.json"));
+  const { bin } = require("wrangler/package.json") as { bin: { wrangler: string } };
+  const wrangler = fileURLToPath(new URL(bin.wrangler, packageUrl));
+  return new Promise<boolean>((resolve) => {
+    const child = spawn(process.execPath, [wrangler, ...args], {
+      cwd: fileURLToPath(new URL("../", import.meta.url)), stdio: "ignore", windowsHide: true,
+    });
+    child.once("error", () => resolve(false));
+    child.once("close", code => resolve(code === 0));
+  });
+}
 export async function main(): Promise<void> {
   const mode = publishMode(process.argv.slice(2));
   const bucket = await bucketName();
   if (mode === "--remote") credentials(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]);
   const manifest = await validateLocal();
   for (const item of publicationPlan(manifest)) {
-    const child = Bun.spawn(["bun", "x", "wrangler", "r2", "object", "put", `${bucket}/${item.key}`, "--file", fileURLToPath(new URL(item.file, DATA_DIR)), mode], {
-      cwd: fileURLToPath(new URL("../", import.meta.url)), stdout: "ignore", stderr: "ignore",
-    });
-    if (await child.exited !== 0) throw new SafeError(`R2 upload failed for ${item.key}; active manifest was not advanced unless its final upload succeeded`);
+    const succeeded = await runWrangler(["r2", "object", "put", `${bucket}/${item.key}`, "--file", fileURLToPath(new URL(item.file, DATA_DIR)), mode]);
+    if (!succeeded) throw new SafeError(`R2 upload failed for ${item.key}; active manifest was not advanced unless its final upload succeeded`);
   }
   console.log(`Published ${manifest.version} (${mode.slice(2)}); active manifest written last`);
 }
