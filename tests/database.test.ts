@@ -10,10 +10,14 @@ import { dataset, fakeBucket, gate, mmdb } from "./fixtures";
 
 test("synthetic MMDBs pass real reader, downloader and lookup validation", async () => {
   const data = dataset();
-  for (const kind of DATABASE_KINDS) expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
+  for (const kind of DATABASE_KINDS)
+    expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
   const { bucket } = fakeBucket(data);
   const snapshot = await loadSnapshot(bucket, data.manifest);
-  for (const address of [{ ip: "8.8.8.8", version: 4 as const }, { ip: "2606:4700::1", version: 6 as const }]) {
+  for (const address of [
+    { ip: "8.8.8.8", version: 4 as const },
+    { ip: "2606:4700::1", version: 6 as const },
+  ]) {
     const result = await lookup(address, snapshot);
     expect(result.country?.code).toBe("US");
     expect(result.asn?.number).toBe(13335);
@@ -22,10 +26,16 @@ test("synthetic MMDBs pass real reader, downloader and lookup validation", async
   const full = await lookup({ ip: "8.8.8.8", version: 4 }, snapshot);
   expect(full.records.city?.future_field).toEqual({ retained: true });
   expect(full.records.city?.traits).toEqual({ is_anycast: true });
-  expect(full.records.city?.city).toEqual({ geoname_id: 42, names: { en: "Test City", fr: "Ville test" } });
+  expect(full.records.city?.city).toEqual({
+    geoname_id: 42,
+    names: { en: "Test City", fr: "Ville test" },
+  });
   async function reader(kind: "country" | "asn", value: unknown) {
     const data = mmdb(kind, undefined, value);
-    return AsyncMmdb.open({ size: data.length, read: async (offset, length) => data.subarray(offset, offset + length) });
+    return AsyncMmdb.open({
+      size: data.length,
+      read: async (offset, length) => data.subarray(offset, offset + length),
+    });
   }
   snapshot.readers.country = await reader("country", { registered_country: { iso_code: "US" } });
   snapshot.readers.asn = await reader("asn", {});
@@ -36,11 +46,19 @@ test("synthetic MMDBs pass real reader, downloader and lookup validation", async
 });
 
 test("sparse anycast-style records validate and remain location-unknown at runtime", async () => {
-  for (const record of [{}, { registered_country: { iso_code: "US" } }, { traits: { is_anycast: true } }]) {
+  for (const record of [
+    {},
+    { registered_country: { iso_code: "US" } },
+    { traits: { is_anycast: true } },
+  ]) {
     const data = dataset(undefined, { country: record, city: record });
-    for (const kind of DATABASE_KINDS) expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
+    for (const kind of DATABASE_KINDS)
+      expect(validateDatabase(kind, data[kind])).toBe(data.manifest.updatedAt);
     const snapshot = await loadSnapshot(fakeBucket(data).bucket, data.manifest);
-    for (const address of [{ ip: "1.1.1.1", version: 4 as const }, { ip: "2606:4700:4700::1111", version: 6 as const }]) {
+    for (const address of [
+      { ip: "1.1.1.1", version: 4 as const },
+      { ip: "2606:4700:4700::1111", version: 6 as const },
+    ]) {
       const result = await lookup(address, snapshot);
       expect(result.country).toBeNull();
       expect(result.records.country).toEqual(record);
@@ -54,17 +72,20 @@ test("manifests reject invalid keys, schemas and excessive memory", () => {
   const good = dataset().manifest;
   expect(parseManifest(good)).toEqual(good);
   for (const change of [
-    { schemaVersion: 3 }, { version: "../bad" }, { updatedAt: "yesterday" },
+    { schemaVersion: 3 },
+    { version: "../bad" },
+    { updatedAt: "yesterday" },
     { files: { ...good.files, country: { ...good.files.country, key: "manifest.json" } } },
     { files: { ...good.files, country: { ...good.files.country, bytes: MAX_DATABASE_BYTES } } },
-  ]) expect(() => parseManifest({ ...good, ...change })).toThrow();
+  ])
+    expect(() => parseManifest({ ...good, ...change })).toThrow();
 });
 
 test("concurrent requests share one load, cached reads do not hit R2", async () => {
   const fake = fakeBucket();
   const store = new DatabaseStore(fake.bucket);
   const results = await Promise.all(Array.from({ length: 20 }, () => store.get()));
-  expect(new Set(results.map(r => r.snapshot)).size).toBe(1);
+  expect(new Set(results.map((r) => r.snapshot)).size).toBe(1);
   expect(fake.calls.length).toBe(4);
   await store.get();
   expect(fake.calls.length).toBe(4);
@@ -80,7 +101,8 @@ test("cold initialization overlaps metadata reads across all three databases", a
     // Each metadata tail straddles two pages; all six requests must start
     // before any completes, rather than six sequential storage round trips.
     expect(fake.calls).toHaveLength(6);
-    for (const kind of DATABASE_KINDS) expect(fake.calls.filter(key => key === data.manifest.files[kind].key)).toHaveLength(2);
+    for (const kind of DATABASE_KINDS)
+      expect(fake.calls.filter((key) => key === data.manifest.files[kind].key)).toHaveLength(2);
   } finally {
     reads.release();
     await pending;
@@ -92,7 +114,9 @@ test("warm requests serve a validated snapshot while one background refresh swit
   const old = dataset(now / 1000 - 3600);
   const refresh = gate();
   let hold = false;
-  const fake = fakeBucket(old, async () => { if (hold) await refresh.promise; });
+  const fake = fakeBucket(old, async () => {
+    if (hold) await refresh.promise;
+  });
   const store = new DatabaseStore(fake.bucket, () => now);
   const first = await store.get();
   const next = dataset(now / 1000);
@@ -100,7 +124,11 @@ test("warm requests serve a validated snapshot while one background refresh swit
   hold = true;
   now += 300_001;
   const background: Promise<unknown>[] = [];
-  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  const context = {
+    waitUntil(promise: Promise<unknown>) {
+      background.push(promise);
+    },
+  };
   try {
     const response = await store.get(context);
     expect(response.snapshot).toBe(first.snapshot);
@@ -108,7 +136,7 @@ test("warm requests serve a validated snapshot while one background refresh swit
     expect((await store.get(context)).snapshot).toBe(first.snapshot);
     expect(background).toHaveLength(2);
     expect(background[0]).toBe(background[1]);
-    expect(fake.calls.filter(key => key === "manifest.json")).toHaveLength(2);
+    expect(fake.calls.filter((key) => key === "manifest.json")).toHaveLength(2);
   } finally {
     refresh.release();
     await Promise.all(background);
@@ -124,7 +152,11 @@ test("background refresh failure reports stale, throttles retries and recovers",
   fake.objects.delete("manifest.json");
   now += 300_001;
   const background: Promise<unknown>[] = [];
-  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  const context = {
+    waitUntil(promise: Promise<unknown>) {
+      background.push(promise);
+    },
+  };
   expect((await store.get(context)).snapshot).toBe(first.snapshot);
   await Promise.all(background);
   const calls = fake.calls.length;
@@ -143,10 +175,16 @@ test("cold requests with a context still wait for validation", async () => {
   const store = new DatabaseStore(fake.bucket);
   const background: Promise<unknown>[] = [];
   let returned = false;
-  const pending = store.get({ waitUntil(promise) { background.push(promise); } }).then(result => {
-    returned = true;
-    return result;
-  });
+  const pending = store
+    .get({
+      waitUntil(promise) {
+        background.push(promise);
+      },
+    })
+    .then((result) => {
+      returned = true;
+      return result;
+    });
   try {
     await sleep(0);
     expect(returned).toBe(false);
@@ -162,17 +200,30 @@ test("an expiring snapshot cannot bypass an already pending background refresh",
   const old = dataset(now / 1000 - 30 * 86400 + 600);
   const refresh = gate();
   let hold = false;
-  const fake = fakeBucket(old, async () => { if (hold) await refresh.promise; });
+  const fake = fakeBucket(old, async () => {
+    if (hold) await refresh.promise;
+  });
   const store = new DatabaseStore(fake.bucket, () => now);
   await store.get();
   now += 300_001;
   hold = true;
   const background: Promise<unknown>[] = [];
-  const context = { waitUntil(promise: Promise<unknown>) { background.push(promise); } };
+  const context = {
+    waitUntil(promise: Promise<unknown>) {
+      background.push(promise);
+    },
+  };
   await store.get(context);
   now += 300_001;
   let returned = false;
-  const expired = store.get(context).then(() => { returned = true; }, () => { returned = true; });
+  const expired = store.get(context).then(
+    () => {
+      returned = true;
+    },
+    () => {
+      returned = true;
+    },
+  );
   try {
     await sleep(0);
     expect(returned).toBe(false);
@@ -233,5 +284,7 @@ test("checksum, truncation, metadata and expiry are enforced", async () => {
   await expect(loadSnapshot(fake.bucket, mismatch)).rejects.toThrow("metadata");
   const expired = dataset(Math.floor(Date.now() / 1000) - 31 * 86400);
   expect(() => validateDatabase("country", expired.country)).toThrow("freshness");
-  await expect(new DatabaseStore(fakeBucket(expired).bucket).get()).rejects.toThrow("not available");
+  await expect(new DatabaseStore(fakeBucket(expired).bucket).get()).rejects.toThrow(
+    "not available",
+  );
 });

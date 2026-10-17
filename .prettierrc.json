@@ -1,0 +1,10 @@
+{
+  "printWidth": 100,
+  "endOfLine": "lf",
+  "overrides": [
+    {
+      "files": "wrangler.jsonc",
+      "options": { "parser": "json" }
+    }
+  ]
+}

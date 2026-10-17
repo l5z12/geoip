@@ -1,0 +1,17 @@
+# Generated output, local databases, and credentials.
+node_modules/
+dist/
+.wrangler/
+.data/
+.test-data/
+coverage/
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.mmdb
+*.tar.gz
+*.log
+
+# Managed by pnpm.
+pnpm-lock.yaml

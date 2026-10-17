@@ -7,7 +7,9 @@ const MAX_READ_BYTES = 1024 * 1024;
 const MAX_IN_FLIGHT = 8;
 
 export class PageUnavailable extends Error {
-  constructor() { super("Database page is unavailable or failed integrity validation"); }
+  constructor() {
+    super("Database page is unavailable or failed integrity validation");
+  }
 }
 
 /** Bounded LRU shared by all datasets and generations in an isolate. */
@@ -18,10 +20,16 @@ export class PageCache {
   private active = 0;
   private waiting: (() => void)[] = [];
 
-  constructor(private bucket: R2Bucket, private capacity = CACHE_BYTES) {}
+  constructor(
+    private bucket: R2Bucket,
+    private capacity = CACHE_BYTES,
+  ) {}
 
   private async acquire(): Promise<void> {
-    if (this.active < MAX_IN_FLIGHT) { this.active++; return; }
+    if (this.active < MAX_IN_FLIGHT) {
+      this.active++;
+      return;
+    }
     await new Promise<void>((resolve) => this.waiting.push(resolve));
   }
 
@@ -41,7 +49,9 @@ export class PageCache {
     }
     let pending = this.pending.get(key);
     if (!pending) {
-      pending = this.download(file, index).finally(() => { this.pending.delete(key); });
+      pending = this.download(file, index).finally(() => {
+        this.pending.delete(key);
+      });
       this.pending.set(key, pending);
     }
     return pending;
@@ -50,7 +60,8 @@ export class PageCache {
   private async download(file: DatabaseFile, index: number): Promise<Uint8Array> {
     const offset = index * PAGE_BYTES;
     const length = Math.min(PAGE_BYTES, file.bytes - offset);
-    if (!Number.isSafeInteger(index) || index < 0 || length <= 0 || !file.pageSha256[index]) throw new PageUnavailable();
+    if (!Number.isSafeInteger(index) || index < 0 || length <= 0 || !file.pageSha256[index])
+      throw new PageUnavailable();
     await this.acquire();
     try {
       const object = await this.bucket.get(file.key, { range: { offset, length } });
@@ -87,8 +98,14 @@ export class PageCache {
     return {
       size: file.bytes,
       read: async (offset, length) => {
-        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
-            offset < 0 || length < 0 || length > MAX_READ_BYTES || offset + length > file.bytes) {
+        if (
+          !Number.isSafeInteger(offset) ||
+          !Number.isSafeInteger(length) ||
+          offset < 0 ||
+          length < 0 ||
+          length > MAX_READ_BYTES ||
+          offset + length > file.bytes
+        ) {
           throw new Error("Database read is outside allowed bounds");
         }
         if (length === 0) return new Uint8Array();
@@ -96,12 +113,13 @@ export class PageCache {
         const last = Math.floor((offset + length - 1) / PAGE_BYTES);
         if (first === last) {
           const page = await this.page(file, first);
-          return page.subarray(offset % PAGE_BYTES, offset % PAGE_BYTES + length);
+          return page.subarray(offset % PAGE_BYTES, (offset % PAGE_BYTES) + length);
         }
         // Metadata and straddling values need multiple known pages. Fetch them
         // together under the shared download limit instead of serial round trips.
-        const pages = await Promise.allSettled(Array.from({ length: last - first + 1 },
-          (_, index) => this.page(file, first + index)));
+        const pages = await Promise.allSettled(
+          Array.from({ length: last - first + 1 }, (_, index) => this.page(file, first + index)),
+        );
         const output = new Uint8Array(length);
         for (const [index, result] of pages.entries()) {
           if (result.status === "rejected") throw result.reason;
@@ -115,5 +133,7 @@ export class PageCache {
     };
   }
 
-  get cachedBytes(): number { return this.bytes; }
+  get cachedBytes(): number {
+    return this.bytes;
+  }
 }

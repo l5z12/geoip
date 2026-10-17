@@ -7,10 +7,18 @@ import { sha256 } from "../scripts/shared";
 import { fakeBucket, gate } from "./fixtures";
 
 function fixture(fullPages = 2, beforeGet?: (key: string) => Promise<void>) {
-  const bytes = Buffer.concat([...Array.from({ length: fullPages }, (_, index) => Buffer.alloc(PAGE_BYTES, (index + 1) * 11)), Buffer.alloc(19, 33)]);
+  const bytes = Buffer.concat([
+    ...Array.from({ length: fullPages }, (_, index) => Buffer.alloc(PAGE_BYTES, (index + 1) * 11)),
+    Buffer.alloc(19, 33),
+  ]);
   const file: DatabaseFile = {
-    key: "pages.mmdb", bytes: bytes.length, sha256: sha256(bytes), buildEpoch: new Date().toISOString(),
-    pageSha256: Array.from({ length: fullPages + 1 }, (_, index) => sha256(bytes.subarray(index * PAGE_BYTES, (index + 1) * PAGE_BYTES))),
+    key: "pages.mmdb",
+    bytes: bytes.length,
+    sha256: sha256(bytes),
+    buildEpoch: new Date().toISOString(),
+    pageSha256: Array.from({ length: fullPages + 1 }, (_, index) =>
+      sha256(bytes.subarray(index * PAGE_BYTES, (index + 1) * PAGE_BYTES)),
+    ),
   };
   const fake = fakeBucket(undefined, beforeGet);
   fake.objects.set(file.key, bytes);
@@ -21,12 +29,18 @@ test("page source reads across boundaries, verifies partial final pages and dedu
   const f = fixture();
   const cache = new PageCache(f.bucket);
   const source = cache.source(f.file);
-  const results = await Promise.all(Array.from({ length: 10 }, () => source.read(PAGE_BYTES - 2, 4)));
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () => source.read(PAGE_BYTES - 2, 4)),
+  );
   for (const result of results) expect([...result]).toEqual([11, 11, 22, 22]);
   expect(f.calls.length).toBe(2);
-  expect([...await source.read(PAGE_BYTES * 2 + 17, 2)]).toEqual([33, 33]);
+  expect([...(await source.read(PAGE_BYTES * 2 + 17, 2))]).toEqual([33, 33]);
   expect(cache.cachedBytes).toBe(f.bytes.length);
-  expect(Buffer.from(await source.read(PAGE_BYTES - 3, PAGE_BYTES + 22)).equals(f.bytes.subarray(PAGE_BYTES - 3))).toBe(true);
+  expect(
+    Buffer.from(await source.read(PAGE_BYTES - 3, PAGE_BYTES + 22)).equals(
+      f.bytes.subarray(PAGE_BYTES - 3),
+    ),
+  ).toBe(true);
   expect(await source.read(f.file.bytes, 0)).toHaveLength(0);
   expect(f.calls).toHaveLength(3);
   await expect(source.read(-1, 1)).rejects.toThrow("bounds");
@@ -43,7 +57,7 @@ test("a boundary-spanning read starts both page downloads before either finishes
     expect(f.calls).toHaveLength(2);
   } finally {
     reads.release();
-    expect([...await pending]).toEqual([11, 11, 22, 22]);
+    expect([...(await pending)]).toEqual([11, 11, 22, 22]);
   }
 });
 

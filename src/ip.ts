@@ -1,7 +1,10 @@
 import ipaddr from "ipaddr.js";
 
 export class IpError extends Error {
-  constructor(public code: "INVALID_IP" | "NON_PUBLIC_IP", message: string) {
+  constructor(
+    public code: "INVALID_IP" | "NON_PUBLIC_IP",
+    message: string,
+  ) {
     super(message);
   }
 }
@@ -13,7 +16,11 @@ export interface ParsedIp {
 
 export function parseIp(input: string): ParsedIp {
   const text = input.trim();
-  const invalid = () => new IpError("INVALID_IP", "Enter a valid IPv4 or IPv6 address, without a port, CIDR suffix, or zone ID.");
+  const invalid = () =>
+    new IpError(
+      "INVALID_IP",
+      "Enter a valid IPv4 or IPv6 address, without a port, CIDR suffix, or zone ID.",
+    );
   if (!text || text.length > 45 || !/^[0-9a-fA-F:.]+$/.test(text)) throw invalid();
   if (!text.includes(":")) {
     if (!ipaddr.IPv4.isValidFourPartDecimal(text)) throw invalid();
@@ -28,9 +35,14 @@ export function parseIp(input: string): ParsedIp {
   const version = address.kind() === "ipv4" ? 4 : 6;
   // AS112 and AMT are globally routed despite having named special ranges.
   const publicRanges = ["unicast", "as112", "as112v6", "amt"];
-  if (!publicRanges.includes(address.range()) ||
-      (address instanceof ipaddr.IPv6 && !address.match(ipaddr.IPv6.parse("2000::"), 3))) {
-    throw new IpError("NON_PUBLIC_IP", "Only public, globally routable IP addresses can be looked up.");
+  if (
+    !publicRanges.includes(address.range()) ||
+    (address instanceof ipaddr.IPv6 && !address.match(ipaddr.IPv6.parse("2000::"), 3))
+  ) {
+    throw new IpError(
+      "NON_PUBLIC_IP",
+      "Only public, globally routable IP addresses can be looked up.",
+    );
   }
   return { ip: address.toString(), version };
 }

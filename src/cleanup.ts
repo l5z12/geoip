@@ -12,8 +12,14 @@ export async function cleanupDatabases(bucket: R2Bucket, now = Date.now()): Prom
     const manifest = await readManifest(bucket);
     const activePrefix = `versions/${manifest.version}/`;
     const keys = page.objects
-      .filter((object) => /^versions\/[a-f0-9]{64}\/(country\.mmdb|city\.mmdb|asn\.mmdb|manifest\.json)$/.test(object.key) &&
-        !object.key.startsWith(activePrefix) && object.uploaded.getTime() < now - RETENTION_MS)
+      .filter(
+        (object) =>
+          /^versions\/[a-f0-9]{64}\/(country\.mmdb|city\.mmdb|asn\.mmdb|manifest\.json)$/.test(
+            object.key,
+          ) &&
+          !object.key.startsWith(activePrefix) &&
+          object.uploaded.getTime() < now - RETENTION_MS,
+      )
       .map((object) => object.key);
     if (keys.length) await bucket.delete(keys);
     cursor = page.truncated ? page.cursor : undefined;

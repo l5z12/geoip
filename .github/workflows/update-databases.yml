@@ -1,7 +1,7 @@
 name: Update databases
 on:
   schedule:
-    - cron: '23 4 * * *'
+    - cron: "23 4 * * *"
   workflow_dispatch:
 permissions:
   contents: read

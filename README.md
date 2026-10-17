@@ -8,14 +8,15 @@ Cloudflare Worker for public IPv4/IPv6 lookups using **GeoLite2 City, Country, a
 2. Create a MaxMind account, accept the [GeoLite2 terms](https://www.maxmind.com/en/geolite2/eula), and generate a license key with database download access. You need the **account ID as well as the key**. A web-services-only key without GeoLite2 download entitlement is not sufficient.
 3. Add these GitHub Actions secrets (repository secrets or the `production` environment):
 
-   | Secret | Value |
-   | --- | --- |
-   | `MAXMIND_ACCOUNT_ID` | MaxMind account ID |
-   | `MAXMIND_LICENSE_KEY` | MaxMind license/API key with download access |
-   | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
-   | `CLOUDFLARE_API_TOKEN` | **Workers Scripts: Edit** and **Workers R2 Storage: Edit** for the account; **Zone: Read** and **Workers Routes: Edit** for the `l5z12.dev` zone |
+   | Secret                  | Value                                                                                                                                            |
+   | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+   | `MAXMIND_ACCOUNT_ID`    | MaxMind account ID                                                                                                                               |
+   | `MAXMIND_LICENSE_KEY`   | MaxMind license/API key with download access                                                                                                     |
+   | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID                                                                                                                            |
+   | `CLOUDFLARE_API_TOKEN`  | **Workers Scripts: Edit** and **Workers R2 Storage: Edit** for the account; **Zone: Read** and **Workers Routes: Edit** for the `l5z12.dev` zone |
 
    Enable the account's `workers.dev` subdomain in the Cloudflare dashboard if not already configured; it remains available alongside the custom domain. Do not paste credentials into code, issues, or workflow files.
+
 4. Push this project to a GitHub repository's `main` branch (or run **Deploy** manually from that branch). Deployment validates the project, creates `geoip-databases` if missing, downloads and publishes all three databases, and deploys the `geoip` Worker at **https://geoip.l5z12.dev**. Wrangler also prints its `workers.dev` URL.
 
 The Worker/bucket names and custom domain live in `wrangler.jsonc`. Deployment registers `geoip.l5z12.dev` as a Workers Custom Domain; Cloudflare manages its DNS record and TLS certificate. Do not create a CNAME pointing at `workers.dev`. If this hostname already has a conflicting DNS record or Worker binding, resolve that conflict before deployment. Allow time for DNS and certificate provisioning after the first deployment.
@@ -24,7 +25,7 @@ The bucket is dedicated to this application and should remain private: **do not 
 
 ### Automation
 
-- **CI**: every push and pull request; frozen pnpm install, typecheck, unit tests, bundle, and real `workerd` smoke test. No credentials or MaxMind downloads required.
+- **CI**: every push and pull request; frozen pnpm install, formatting check, typecheck, unit tests, bundle, and real `workerd` smoke test. No credentials or MaxMind downloads required.
 - **Deploy**: pushes to `main` and manual dispatch; validates, provisions, publishes databases, then deploys.
 - **Update databases**: daily at **04:23 UTC**, or manual dispatch; downloads directly from MaxMind and updates R2 without redeploying the Worker. Daily checks do not imply MaxMind publishes a new release daily.
 - Deploy/update workflows share a non-cancelling concurrency group. Ensure the `production` environment permits unattended scheduled jobs. GitHub schedules can be delayed and public-repository schedules can be disabled after inactivity; monitor failed/missing runs and re-enable them if needed.
@@ -34,6 +35,7 @@ The bucket is dedicated to this application and should remain private: **do not 
 
 ```sh
 pnpm install --frozen-lockfile
+pnpm run hooks:install
 cp .env.example .env
 # Fill in MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY in .env.
 pnpm run db:local
@@ -44,6 +46,9 @@ Open `http://localhost:8787`. `db:local` downloads real MaxMind data, validates 
 
 ```sh
 pnpm run check          # strict TypeScript
+pnpm run format         # format source, configuration, and documentation
+pnpm run format:check   # check formatting without changing files
+pnpm run hooks:check    # run prek hooks against all tracked files
 pnpm test               # deterministic unit tests; synthetic MMDB fixtures
 pnpm run test:runtime   # bundle + real workerd/R2 lookup smoke test
 pnpm run bench:lookup   # synthetic storage-latency benchmark (no network or credentials)
@@ -54,6 +59,8 @@ pnpm run deploy         # deploy code/assets only; publish databases first
 ```
 
 Use **Node.js 24** (at least 24.10.0) and **pnpm 10.34.7**. The pnpm version is pinned in `package.json`; workflows use `.node-version` and `pnpm-lock.yaml`. Tests use Vitest; TypeScript scripts run on Node.js with tsx. Database scripts load `.env` when present, with existing environment variables taking precedence. `.env`, `.data`, local R2 state, database archives, and MMDBs are ignored by Git. No database artifacts are uploaded to GitHub. Local `.data/licenses/` retains notices provided by MaxMind archives.
+
+Prettier and prek are pinned development dependencies, so no global installation is needed. Run `pnpm run hooks:install` once per clone to enable the pre-commit hook. It formats changed text files with the project's Prettier version; if it changes a staged file, review and stage that file again before committing. CI and deployment use `pnpm run format:check` to reject formatting drift without rewriting files. `.prettierignore` excludes generated output, private data, and the pnpm lockfile. Git and Prettier use LF line endings; `wrangler.jsonc` is formatted as strict JSON because the database scripts parse it with `JSON.parse`.
 
 ## API
 

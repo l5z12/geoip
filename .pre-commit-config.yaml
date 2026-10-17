@@ -1,0 +1,10 @@
+minimum_prek_version: "0.5.5"
+repos:
+  - repo: local
+    hooks:
+      - id: prettier
+        name: Prettier
+        language: system
+        entry: pnpm exec prettier --write --ignore-unknown
+        types: [text]
+        require_serial: true

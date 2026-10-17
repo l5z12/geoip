@@ -33,24 +33,42 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 function timestamp(value: unknown): value is string {
-  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
 export function parseManifest(value: unknown): Manifest {
-  if (!record(value) || value.schemaVersion !== 2 ||
-      typeof value.version !== "string" || !/^[a-f0-9]{64}$/.test(value.version) ||
-      !timestamp(value.updatedAt) || !record(value.files)) {
+  if (
+    !record(value) ||
+    value.schemaVersion !== 2 ||
+    typeof value.version !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.version) ||
+    !timestamp(value.updatedAt) ||
+    !record(value.files)
+  ) {
     throw new Error("Invalid database manifest");
   }
   let total = 0;
   for (const kind of DATABASE_KINDS) {
     const file = value.files[kind];
-    if (!record(file) || file.key !== `versions/${value.version}/${kind}.mmdb` ||
-        typeof file.bytes !== "number" || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 ||
-        typeof file.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256) ||
-        !Array.isArray(file.pageSha256) || file.pageSha256.length !== Math.ceil(file.bytes / PAGE_BYTES) ||
-        !file.pageSha256.every((hash: unknown) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash)) ||
-        !timestamp(file.buildEpoch)) {
+    if (
+      !record(file) ||
+      file.key !== `versions/${value.version}/${kind}.mmdb` ||
+      typeof file.bytes !== "number" ||
+      !Number.isSafeInteger(file.bytes) ||
+      file.bytes <= 0 ||
+      typeof file.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(file.sha256) ||
+      !Array.isArray(file.pageSha256) ||
+      file.pageSha256.length !== Math.ceil(file.bytes / PAGE_BYTES) ||
+      !file.pageSha256.every(
+        (hash: unknown) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash),
+      ) ||
+      !timestamp(file.buildEpoch)
+    ) {
       throw new Error(`Invalid ${kind} database descriptor`);
     }
     total += file.bytes;
@@ -63,7 +81,9 @@ export function databaseInfo(manifest: Manifest, stale = false) {
   return {
     version: manifest.version,
     updatedAt: manifest.updatedAt,
-    builds: Object.fromEntries(DATABASE_KINDS.map((kind) => [kind, manifest.files[kind].buildEpoch])),
+    builds: Object.fromEntries(
+      DATABASE_KINDS.map((kind) => [kind, manifest.files[kind].buildEpoch]),
+    ),
     stale,
     sources: SOURCES,
   };

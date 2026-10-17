@@ -11,6 +11,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "check": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "hooks:install": "prek install",
+    "hooks:check": "prek run --all-files",
     "test": "vitest run",
     "test:runtime": "pnpm run build && node --import=tsx tests/runtime-smoke.ts",
     "bench:lookup": "node --import=tsx tests/lookup-benchmark.ts",
@@ -28,8 +32,10 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260905.1",
+    "@j178/prek": "0.5.5",
     "@types/node": "^24.19.2",
     "miniflare": "5.20260903.0-alpha",
+    "prettier": "3.9.10",
     "tsx": "^4.23.15",
     "typescript": "^6.0.2",
     "vitest": "^5.0.5",
