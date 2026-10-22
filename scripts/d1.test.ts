@@ -11,6 +11,7 @@ import {
   capacityLimit,
   exportSql,
   localLookup,
+  rowLimit,
   sqlValue,
   PROBES,
   type BuildStats,
@@ -21,22 +22,32 @@ import { DATABASE_KINDS } from "../src/manifest";
 import { dataset, treeMmdb } from "../tests/fixtures";
 
 test.each([24, 28, 32] as const)(
-  "%i-bit MMDB traversal agrees with the independent reader across boundaries and gaps",
+  "%i-bit MMDB traversal agrees with the independent reader across boundaries, blocks and gaps",
   async (width) => {
-    const bytes = treeMmdb(width, [
-      "8.8.8.0/24",
-      "9.9.9.9/32",
-      "2606:4700::/112",
-      "2606:4700:0:1::/128",
-      "2001:4860::/32",
-    ]);
+    const bytes = treeMmdb(
+      width,
+      ["8.8.8.0/24", "9.9.9.9/32", "2606:4700::/112", "2606:4700:0:1::/128", "2001:4860::/32"],
+      ["2001::/32", "2002::/16"],
+    );
     const reference = new Reader(bytes);
+    // The fixture really aliases 6to4 and Teredo to the IPv4 tree.
+    expect(reference.get("2002:808:808::")).toEqual(reference.get("8.8.8.8"));
+    expect(reference.get("2001:0:909:909::")).toEqual(reference.get("9.9.9.9"));
     const db = new DatabaseSync(":memory:");
     try {
       db.exec(D1_SCHEMA);
-      await addDatabase(db, 0, bytes);
+      await addDatabase(db, 0, bytes, 2);
       expect(db.prepare("SELECT COUNT(*) AS n FROM records").get()!.n).toBe(1);
-      expect(db.prepare("SELECT COUNT(*) AS n FROM ranges").get()!.n).toBe(5);
+      // IPv4 [8.8.8.0, 9.9.9.9]; IPv6 [2001:4860::, 2606:4700::] and [2606:4700:0:1::].
+      expect(
+        db
+          .prepare("SELECT family, json_array_length(data) AS n FROM blocks ORDER BY family, start")
+          .all(),
+      ).toEqual([
+        { family: 4, n: 2 },
+        { family: 6, n: 2 },
+        { family: 6, n: 1 },
+      ]);
       for (const ip of [
         "8.8.7.255",
         "8.8.8.0",
@@ -60,6 +71,8 @@ test.each([24, 28, 32] as const)(
         expect(result ? JSON.parse(result.data) : null, ip).toEqual(record);
         if (record) expect(result?.prefix, ip).toBe(prefix);
       }
+      for (const ip of ["2002:808:808::", "2001:0:909:909::"])
+        expect(localLookup(db, ip), ip).toEqual([]);
     } finally {
       db.close();
     }
@@ -104,6 +117,7 @@ test("full build validates probes, reports size, and exports an unready release"
     for (const kind of DATABASE_KINDS) await writeFile(new URL(`${kind}.mmdb`, url), data[kind]);
     build = await buildD1(data.manifest, url);
     expect(build.ranges).toBe(6);
+    expect(build.blocks).toBe(6);
     expect(build.records).toBe(3);
     expect(build.bytes).toBeGreaterThan(0);
     const restored = new DatabaseSync(":memory:");
@@ -114,6 +128,10 @@ test("full build validates probes, reports size, and exports an unready release"
       restored.close();
     }
     await expect(buildD1(data.manifest, url, 1)).rejects.toThrow("D1_MAX_BYTES");
+    // 6 blocks + 3 records + the metadata insert and its `ready` UPDATE.
+    await expect(buildD1(data.manifest, url, undefined, 10)).rejects.toThrow(
+      "D1 build would write 11 rows, above D1_MAX_ROWS=10",
+    );
   } finally {
     for (const file of build?.files ?? []) await unlink(file);
     for (const kind of DATABASE_KINDS) await unlink(new URL(`${kind}.mmdb`, url));
@@ -123,6 +141,10 @@ test("full build validates probes, reports size, and exports an unready release"
   expect(capacityLimit("500000000")).toBe(500000000);
   for (const value of ["0", "-1", "10000000001", "NaN"])
     expect(() => capacityLimit(value)).toThrow();
+  expect(rowLimit("")).toBe(1_500_000);
+  expect(rowLimit("250000")).toBe(250000);
+  for (const value of ["0", "-1", "100000001", "1.5", "NaN"])
+    expect(() => rowLimit(value)).toThrow();
 });
 
 test("slot selection never selects the live database or accepts an unmanaged live binding", () => {
@@ -165,6 +187,7 @@ test("remote validation rejects partial imports and probe mismatches before acti
   const api = new Cloudflare("account", "secret", request);
   const build: BuildStats = {
     ranges: 6,
+    blocks: 6,
     records: 3,
     bytes: 1000,
     files: [],
@@ -172,9 +195,9 @@ test("remote validation rejects partial imports and probe mismatches before acti
   };
   const result = (results: unknown[]) =>
     Response.json({ success: true, result: [{ success: true, results }] });
-  request.mockResolvedValueOnce(result([{ ranges: 5, records: 3 }]));
+  request.mockResolvedValueOnce(result([{ blocks: 5, records: 3 }]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("row counts");
-  request.mockResolvedValueOnce(result([{ ranges: 6, records: 3 }]));
+  request.mockResolvedValueOnce(result([{ blocks: 6, records: 3 }]));
   request.mockResolvedValueOnce(result([]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("records differ");
   const data = dataset();
