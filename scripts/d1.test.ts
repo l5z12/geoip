@@ -128,9 +128,9 @@ test("full build validates probes, reports size, and exports an unready release"
       restored.close();
     }
     await expect(buildD1(data.manifest, url, 1)).rejects.toThrow("D1_MAX_BYTES");
-    // 6 blocks + 3 records + 1 metadata row.
-    await expect(buildD1(data.manifest, url, undefined, 9)).rejects.toThrow(
-      "D1 build would write 10 rows, above D1_MAX_ROWS=9",
+    // 6 blocks + 3 records + the metadata insert and its `ready` UPDATE.
+    await expect(buildD1(data.manifest, url, undefined, 10)).rejects.toThrow(
+      "D1 build would write 11 rows, above D1_MAX_ROWS=10",
     );
   } finally {
     for (const file of build?.files ?? []) await unlink(file);

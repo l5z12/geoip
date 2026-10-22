@@ -204,7 +204,10 @@ export async function buildD1(
     const bytes = (await stat(path)).size;
     if (!counts.blocks || !counts.records || bytes > maxBytes)
       throw new SafeError("D1 build is empty or exceeds capacity");
-    const rows = counts.blocks + counts.records + 1;
+    // Every insert plus the metadata insert and the later `ready` UPDATE.
+    // Resetting a reused slot drops whole tables; production bills showed that
+    // DDL does not add a write per dropped row.
+    const rows = counts.blocks + counts.records + 2;
     if (rows > maxRows)
       throw new SafeError(
         `D1 build would write ${rows} rows, above D1_MAX_ROWS=${maxRows}; D1 bills every imported row`,
