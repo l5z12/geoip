@@ -20,20 +20,33 @@ test("fresh and repeated dual-stack lookups each make one indexed D1 request", a
   expect(db.calls.every((call) => call.constraint === "first-unconstrained")).toBe(true);
   const plan = db.sql.prepare("EXPLAIN QUERY PLAN " + LOOKUP_SQL).all(4, addressKey("1.1.1.1"));
   const details = plan.map((row) => String(row.detail)).join("\n");
-  expect(details.match(/SEARCH ranges USING PRIMARY KEY/g)).toHaveLength(3);
-  expect(details).not.toContain("SCAN ranges");
+  expect(details.match(/SEARCH blocks USING PRIMARY KEY/g)).toHaveLength(3);
+  expect(details.match(/SEARCH records USING INTEGER PRIMARY KEY/g)).toHaveLength(3);
+  expect(details).not.toContain("SCAN blocks");
+  expect(details).not.toContain("SCAN records");
   expect(details).not.toContain("USE TEMP B-TREE");
 });
 
 test("IPv4/IPv6 predecessor seeks check the end and preserve gaps and exact boundaries", async () => {
   const db = await d1Fixture();
-  db.sql.exec("DELETE FROM ranges");
+  db.sql.exec("DELETE FROM blocks");
   const record = db.sql.prepare("SELECT id FROM records ORDER BY id LIMIT 1").get()!.id;
-  const insert = db.sql.prepare("INSERT INTO ranges VALUES (0, ?, ?, ?, ?, ?)");
-  insert.run(4, addressKey("8.8.8.0"), addressKey("8.8.8.255"), 24, record!);
-  insert.run(4, addressKey("9.9.9.9"), addressKey("9.9.9.9"), 32, record!);
-  insert.run(6, addressKey("2606:4700::"), addressKey("2606:4700::ffff"), 112, record!);
-  insert.run(6, addressKey("2606:4700:0:1::"), addressKey("2606:4700:0:1::"), 128, record!);
+  const insert = db.sql.prepare("INSERT INTO blocks VALUES (0, ?, ?, ?)");
+  const block = (family: 4 | 6, ranges: [string, string, number][]) =>
+    insert.run(
+      family,
+      addressKey(ranges[0]![0]),
+      JSON.stringify(
+        ranges.map(([start, end, prefix]) => [addressKey(start), addressKey(end), prefix, record]),
+      ),
+    );
+  // Gaps both between blocks (IPv4) and inside one block (IPv6).
+  block(4, [["8.8.8.0", "8.8.8.255", 24]]);
+  block(4, [["9.9.9.9", "9.9.9.9", 32]]);
+  block(6, [
+    ["2606:4700::", "2606:4700::ffff", 112],
+    ["2606:4700:0:1::", "2606:4700:0:1::", 128],
+  ]);
   for (const ip of [
     "8.8.8.0",
     "8.8.8.255",

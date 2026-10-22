@@ -34,6 +34,9 @@ export function* mmdbRanges(bytes: Uint8Array, metadata: MmdbMetadata): Generato
   ): Generator<MmdbRange> {
     if (++operations > 50_000_000) throw new Error("MMDB traversal exceeds safety budget");
     if (node === nodeCount) return;
+    // MaxMind aliases Teredo (2001::/32) and 6to4 (2002::/16) to the IPv4 root.
+    // parseIp rejects both, so each alias would only copy the IPv4 tree again.
+    if (family === 6 && node === v4 && v4 < nodeCount) return;
     const bits = family === 4 ? 32 : 128;
     if (node > nodeCount) {
       yield {
@@ -53,8 +56,8 @@ export function* mmdbRanges(bytes: Uint8Array, metadata: MmdbMetadata): Generato
   if (ipVersion === 6) for (let bit = 0; bit < 96 && v4 < nodeCount; bit++) v4 = branch(v4, 0);
   yield* walk(v4, 4, 0n, 0);
   if (ipVersion === 6) {
-    // parseIp accepts IPv6 only in 2000::/3. Exclude IPv4 aliases and other
-    // rejected spaces instead of duplicating their entire trees into D1.
+    // parseIp accepts IPv6 only in 2000::/3. Starting there excludes the
+    // ::ffff:0:0/96 alias and other rejected spaces.
     let v6 = 0,
       prefix = 0;
     for (const bit of [0, 0, 1]) {

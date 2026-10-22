@@ -3,13 +3,16 @@ import { DATABASE_KINDS, databaseInfo, type Manifest } from "./manifest";
 
 // Bump when the SQL layout or conversion semantics change. Identical MaxMind
 // releases must still be rebuilt when the converter changes.
-export const D1_SCHEMA_VERSION = 1;
+export const D1_SCHEMA_VERSION = 2;
+// D1 bills every inserted row. Each block row holds a run of consecutive ranges
+// as a JSON array of [start, end, prefix, record_id], so a full import writes
+// far fewer rows than one row per MMDB leaf.
 export const D1_SCHEMA = `
 CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL, ready INTEGER NOT NULL CHECK(ready IN (0,1)));
 CREATE TABLE records (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
-CREATE TABLE ranges (
+CREATE TABLE blocks (
   kind INTEGER NOT NULL, family INTEGER NOT NULL, start TEXT NOT NULL COLLATE BINARY,
-  end TEXT NOT NULL COLLATE BINARY, prefix INTEGER NOT NULL, record_id INTEGER NOT NULL,
+  data TEXT NOT NULL,
   PRIMARY KEY (kind, family, start)
 ) WITHOUT ROWID;
 `;
@@ -17,15 +20,17 @@ CREATE TABLE ranges (
 export const STATUS_SQL =
   "SELECT -1 AS kind, NULL AS prefix, data FROM metadata WHERE id = 1 AND ready = 1";
 
-// MMDB leaves are disjoint. Seek the nearest preceding start, then check its
-// end *after* LIMIT 1, so gaps never cause a backwards scan through the table.
+// Seek the nearest preceding block start without scanning backwards through
+// gaps. MMDB leaves are disjoint, so at most one range in that block contains
+// the address. CROSS JOIN keeps records as the inner loop of a rowid search.
 export const LOOKUP_SQL = `${STATUS_SQL}\nUNION ALL\n${DATABASE_KINDS.map(
   (_, kind) => `
-SELECT ${kind} AS kind, hit.prefix, records.data FROM (
-  SELECT end, prefix, record_id FROM ranges
+SELECT ${kind} AS kind, item.value ->> 2 AS prefix, records.data FROM (
+  SELECT data FROM blocks
   WHERE kind = ${kind} AND family = ?1 AND start <= ?2
   ORDER BY start DESC LIMIT 1
-) AS hit JOIN records ON records.id = hit.record_id WHERE hit.end >= ?2
+) AS block CROSS JOIN json_each(block.data) AS item CROSS JOIN records
+WHERE item.value ->> 0 <= ?2 AND item.value ->> 1 >= ?2 AND records.id = item.value ->> 3
 `,
 ).join("\nUNION ALL\n")}`;
 

@@ -111,10 +111,16 @@ function scatter(data: unknown): Buffer {
   return bytes;
 }
 
-export function treeMmdb(recordSize: 24 | 28 | 32, networks: string[]): Buffer {
+/** `aliases` are IPv6 prefixes pointed at the IPv4 root, as MaxMind does for
+ * Teredo (2001::/32) and 6to4 (2002::/16). */
+export function treeMmdb(
+  recordSize: 24 | 28 | 32,
+  networks: string[],
+  aliases: string[] = [],
+): Buffer {
   type Node = [number | "empty" | "record", number | "empty" | "record"];
   const nodes: Node[] = [["empty", "empty"]];
-  for (const network of networks) {
+  function place(network: string, value: number | "record") {
     const [ip, prefix] = network.split("/");
     const address = ipaddr.parse(ip!);
     const bytes = address.toByteArray();
@@ -127,7 +133,7 @@ export function treeMmdb(recordSize: 24 | 28 | 32, networks: string[]): Buffer {
     for (let i = 0; i < depth; i++) {
       const bit = bits[i]! as 0 | 1;
       if (i === depth - 1) {
-        nodes[node]![bit] = "record";
+        nodes[node]![bit] = value;
         break;
       }
       if (nodes[node]![bit] === "empty") {
@@ -139,6 +145,14 @@ export function treeMmdb(recordSize: 24 | 28 | 32, networks: string[]): Buffer {
       node = next;
     }
   }
+  for (const network of networks) place(network, "record");
+  let ipv4 = 0;
+  for (let i = 0; aliases.length && i < 96; i++) {
+    const next = nodes[ipv4]![0];
+    if (typeof next !== "number") throw new Error("Aliases require an IPv4 subtree");
+    ipv4 = next;
+  }
+  for (const alias of aliases) place(alias, ipv4);
   const tree = Buffer.alloc((nodes.length * recordSize) / 4);
   function write(offset: number, value: number, length: number) {
     for (let i = length - 1; i >= 0; i--) {

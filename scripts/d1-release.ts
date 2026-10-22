@@ -146,8 +146,8 @@ export async function writeReleaseConfig(config: ProjectConfig, db: D1Info, vers
 }
 
 export async function validateRemote(api: Cloudflare, id: string, build: BuildStats) {
-  const [counts] = await api.query<{ ranges: number; records: number }>(id, COUNTS_SQL);
-  if (counts?.ranges !== build.ranges || counts?.records !== build.records)
+  const [counts] = await api.query<{ blocks: number; records: number }>(id, COUNTS_SQL);
+  if (counts?.blocks !== build.blocks || counts?.records !== build.records)
     throw new SafeError("D1 imported row counts differ from the validated build");
   for (const [index, ip] of PROBES.entries()) {
     const rows = await api.query<LookupRow>(id, LOOKUP_SQL, [
