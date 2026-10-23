@@ -26,6 +26,7 @@ import {
   activate,
   chooseSlot,
   Cloudflare,
+  MAX_BASE_AGE_MS,
   MismatchError,
   patchBase,
   readyRelease,
@@ -293,9 +294,14 @@ test("only a ready slot or an interrupted patch toward the same release is patch
       db.prepare("INSERT OR REPLACE INTO metadata VALUES (1, ?, ?, ?)").run(data, ready, patchFrom);
     set(metadata, 1, null);
     expect(await patchBase(api, "inactive", other)).toBe(data.manifest.version);
-    // Archives may be pruned 29 days after upload.
-    const later = Date.parse(data.manifest.updatedAt) + 29 * 86400000;
-    expect(await patchBase(api, "inactive", other, later)).toBeUndefined();
+    // Archives are pruned 29 days after upload, and a build dated 2 days ahead
+    // makes its upload look that much younger.
+    const built = Date.parse(data.manifest.updatedAt);
+    expect(await patchBase(api, "inactive", other, built + 25 * 86400000)).toBe(
+      data.manifest.version,
+    );
+    expect(MAX_BASE_AGE_MS + 2 * 86400000).toBeLessThan(29 * 86400000);
+    expect(await patchBase(api, "inactive", other, built + MAX_BASE_AGE_MS)).toBeUndefined();
     set(metadata, 0, from);
     expect(await patchBase(api, "inactive", data.manifest.version)).toBe(from);
     expect(await patchBase(api, "inactive", other)).toBeUndefined();

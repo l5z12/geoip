@@ -172,9 +172,11 @@ export async function validateRemote(api: Cloudflare, id: string, build: BuildSt
   }
 }
 
-// Archive cleanup prunes superseded releases 29 days after upload, and a
-// release is uploaded after its newest build; older ones are rebuilt in full.
-const MAX_BASE_AGE_MS = 28 * 24 * 60 * 60 * 1000;
+// Archive cleanup prunes superseded releases 29 days after upload. Validation
+// accepts builds dated up to 2 days ahead, so `updatedAt` can trail the
+// upload's age by that much; with a day to spare, releases built 26 or more
+// days ago are rebuilt in full rather than patched from a pruned archive.
+export const MAX_BASE_AGE_MS = (29 - 2 - 1) * 24 * 60 * 60 * 1000;
 
 /** The release an inactive slot can be patched from: its ready release, or the
  * base of an interrupted patch toward `version`. Undefined means import in
