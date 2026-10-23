@@ -18,9 +18,20 @@ import {
   startsBlock,
   BLOCK_MAX_RANGES,
   PROBES,
+  RESET_SQL,
   type BuildStats,
 } from "./build-d1";
-import { chooseSlot, Cloudflare, patchBase, readyRelease, validateRemote } from "./d1-release";
+import {
+  acquireLease,
+  activate,
+  chooseSlot,
+  Cloudflare,
+  MismatchError,
+  patchBase,
+  readyRelease,
+  releaseLease,
+  validateRemote,
+} from "./d1-release";
 import { D1_SCHEMA, releaseMetadata } from "../src/d1-schema";
 import { DATABASE_KINDS } from "../src/manifest";
 import { dataset, treeMmdb } from "../tests/fixtures";
@@ -254,30 +265,91 @@ test("a patch turns the slot's release into the new build and is safe to rerun",
   }
 });
 
+/** A control API client whose D1 queries run against local SQLite. */
+function sqliteApi(db: DatabaseSync) {
+  const request = vi.fn<typeof fetch>(async (_url, init) => {
+    const { sql, params } = JSON.parse(init!.body as string);
+    try {
+      const results = db.prepare(sql).all(...params);
+      return Response.json({ success: true, result: [{ success: true, results }] });
+    } catch {
+      return Response.json({ success: false }, { status: 400 });
+    }
+  });
+  return { api: new Cloudflare("account", "secret", request), request };
+}
+
 test("only a ready slot or an interrupted patch toward the same release is patched", async () => {
-  const request = vi.fn<typeof fetch>();
-  const api = new Cloudflare("account", "secret", request);
-  const data = dataset();
-  const metadata = releaseMetadata(data.manifest);
-  const [from, other] = ["b".repeat(64), "c".repeat(64)];
-  const row = (ready: number, patch_from: string | null, value: object = metadata) =>
-    Response.json({
-      success: true,
-      result: [{ success: true, results: [{ data: JSON.stringify(value), ready, patch_from }] }],
+  const db = new DatabaseSync(":memory:");
+  try {
+    const { api, request } = sqliteApi(db);
+    const data = dataset();
+    const metadata = JSON.stringify(releaseMetadata(data.manifest));
+    const [from, other] = ["b".repeat(64), "c".repeat(64)];
+    // A new slot has no tables.
+    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    db.exec(D1_SCHEMA);
+    const set = (data: string, ready: number, patchFrom: string | null) =>
+      db.prepare("INSERT OR REPLACE INTO metadata VALUES (1, ?, ?, ?)").run(data, ready, patchFrom);
+    set(metadata, 1, null);
+    expect(await patchBase(api, "inactive", other)).toBe(data.manifest.version);
+    // Archives may be pruned 29 days after upload.
+    const later = Date.parse(data.manifest.updatedAt) + 29 * 86400000;
+    expect(await patchBase(api, "inactive", other, later)).toBeUndefined();
+    set(metadata, 0, from);
+    expect(await patchBase(api, "inactive", data.manifest.version)).toBe(from);
+    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    set(metadata, 0, null);
+    expect(await patchBase(api, "inactive", data.manifest.version)).toBeUndefined();
+    set("not json", 1, null);
+    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    db.exec("DROP TABLE blocks");
+    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    // Schema 2 metadata has no patch_from column.
+    db.exec(RESET_SQL + D1_SCHEMA.replace(", patch_from TEXT", ""));
+    db.prepare("INSERT INTO metadata VALUES (1, ?, 1)").run(
+      JSON.stringify({ ...releaseMetadata(data.manifest), schemaVersion: 2 }),
+    );
+    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    // An API failure is not a reason to import in full.
+    request.mockResolvedValueOnce(new Response(null, { status: 503 }));
+    await expect(patchBase(api, "inactive", other)).rejects.toThrow("HTTP 503");
+  } finally {
+    db.close();
+  }
+});
+
+test("a slot lease admits one publisher, survives full imports, and gates activation", async () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    const { api } = sqliteApi(db);
+    const now = Date.now();
+    await acquireLease(api, "inactive", "a", now);
+    await acquireLease(api, "inactive", "a", now + 1000);
+    await expect(acquireLease(api, "inactive", "b", now + 1000)).rejects.toThrow(
+      "Another publisher",
+    );
+    db.exec(RESET_SQL + D1_SCHEMA);
+    db.exec("INSERT INTO metadata VALUES (1, '{}', 0, 'x')");
+    await expect(acquireLease(api, "inactive", "b", now + 1000)).rejects.toThrow(
+      "Another publisher",
+    );
+    // An abandoned lease expires.
+    await acquireLease(api, "inactive", "b", now + 3 * 60 * 60 * 1000);
+    await expect(activate(api, "inactive", "a")).rejects.toThrow("Lost");
+    expect(db.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
+    await activate(api, "inactive", "b");
+    expect(db.prepare("SELECT ready, patch_from FROM metadata").get()).toEqual({
+      ready: 1,
+      patch_from: null,
     });
-  request.mockResolvedValueOnce(row(1, null));
-  expect(await patchBase(api, "inactive", other)).toBe(data.manifest.version);
-  request.mockResolvedValueOnce(row(0, from));
-  expect(await patchBase(api, "inactive", data.manifest.version)).toBe(from);
-  request.mockResolvedValueOnce(row(0, from));
-  expect(await patchBase(api, "inactive", other)).toBeUndefined();
-  request.mockResolvedValueOnce(row(0, null));
-  expect(await patchBase(api, "inactive", data.manifest.version)).toBeUndefined();
-  request.mockResolvedValueOnce(row(1, null, { ...metadata, schemaVersion: 2 }));
-  expect(await patchBase(api, "inactive", other)).toBeUndefined();
-  // Schema 2 slots have no patch_from column, so the query itself fails.
-  request.mockResolvedValueOnce(new Response(null, { status: 400 }));
-  expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    await releaseLease(api, "inactive", "a");
+    await expect(acquireLease(api, "inactive", "a", now + 3 * 60 * 60 * 1000)).rejects.toThrow();
+    await releaseLease(api, "inactive", "b");
+    await acquireLease(api, "inactive", "a", now + 3 * 60 * 60 * 1000);
+  } finally {
+    db.close();
+  }
 });
 
 test("slot selection never selects the live database or accepts an unmanaged live binding", () => {
@@ -318,21 +390,28 @@ test("control API distinguishes a missing Worker from permission failures and ch
 test("remote validation rejects partial imports and probe mismatches before activation", async () => {
   const request = vi.fn<typeof fetch>();
   const api = new Cloudflare("account", "secret", request);
+  const sums = { blocks: 6, blockHash: 123, records: 3, recordHash: 456 };
   const build: BuildStats = {
     ranges: 6,
-    blocks: 6,
-    records: 3,
+    ...sums,
     bytes: 1000,
     path: "",
     probes: PROBES.map(() => [{ kind: 0, prefix: 24, data: "{}" }]),
   };
   const result = (results: unknown[]) =>
     Response.json({ success: true, result: [{ success: true, results }] });
-  request.mockResolvedValueOnce(result([{ blocks: 5, records: 3 }]));
+  request.mockResolvedValueOnce(result([{ ...sums, blocks: 5 }]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("row counts");
-  request.mockResolvedValueOnce(result([{ blocks: 6, records: 3 }]));
+  // Equal counts with a stale row inside still differ by content.
+  request.mockResolvedValueOnce(result([{ ...sums, blockHash: 124 }]));
+  await expect(validateRemote(api, "inactive", build)).rejects.toThrow(MismatchError);
+  request.mockResolvedValueOnce(result([sums]));
   request.mockResolvedValueOnce(result([]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("records differ");
+  // Operational failures are not mismatches, so they never force a full import.
+  request.mockResolvedValueOnce(new Response(null, { status: 502 }));
+  const failure = await validateRemote(api, "inactive", build).catch((error) => error);
+  expect(failure).not.toBeInstanceOf(MismatchError);
   const data = dataset();
   request.mockResolvedValueOnce(
     result([{ kind: -1, prefix: null, data: JSON.stringify(releaseMetadata(data.manifest)) }]),

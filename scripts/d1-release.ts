@@ -8,7 +8,7 @@ import {
   type ReleaseMetadata,
 } from "../src/d1-schema";
 import { readMetadata } from "../src/database";
-import { COUNTS_SQL, PROBES, type BuildStats } from "./build-d1";
+import { CHECKSUM_SQL, PROBES, type BuildStats, type Checksum } from "./build-d1";
 import { SafeError } from "./shared";
 
 export const RELEASE_CONFIG = new URL("../.wrangler-release.json", import.meta.url);
@@ -146,10 +146,15 @@ export async function writeReleaseConfig(config: ProjectConfig, db: D1Info, vers
   );
 }
 
+/** The slot's rows differ from the build; other validation errors are operational. */
+export class MismatchError extends SafeError {}
+
 export async function validateRemote(api: Cloudflare, id: string, build: BuildStats) {
-  const [counts] = await api.query<{ blocks: number; records: number }>(id, COUNTS_SQL);
-  if (counts?.blocks !== build.blocks || counts?.records !== build.records)
-    throw new SafeError("D1 imported row counts differ from the validated build");
+  const [sum] = await api.query<Checksum>(id, CHECKSUM_SQL);
+  if (sum?.blocks !== build.blocks || sum?.records !== build.records)
+    throw new MismatchError("D1 imported row counts differ from the validated build");
+  if (sum.blockHash !== build.blockHash || sum.recordHash !== build.recordHash)
+    throw new MismatchError("D1 imported row contents differ from the validated build");
   for (const [index, ip] of PROBES.entries()) {
     const rows = await api.query<LookupRow>(id, LOOKUP_SQL, [
       ip.includes(":") ? 6 : 4,
@@ -163,38 +168,82 @@ export async function validateRemote(api: Cloudflare, id: string, build: BuildSt
           .sort((a, b) => Number(a[0]) - Number(b[0])),
       );
     if (normalize(rows) !== normalize(build.probes[index]!))
-      throw new SafeError("D1 imported records differ from the validated build");
+      throw new MismatchError("D1 imported records differ from the validated build");
   }
 }
 
+// Archive cleanup prunes superseded releases 29 days after upload, and a
+// release is uploaded after its newest build; older ones are rebuilt in full.
+const MAX_BASE_AGE_MS = 28 * 24 * 60 * 60 * 1000;
+
 /** The release an inactive slot can be patched from: its ready release, or the
- * base of an interrupted patch toward `version`. Anything else is rebuilt. */
+ * base of an interrupted patch toward `version`. Undefined means import in
+ * full; API failures throw rather than trigger a needless full import. */
 export async function patchBase(
   api: Cloudflare,
   id: string,
   version: string,
+  now = Date.now(),
 ): Promise<string | undefined> {
-  // A missing table or column means an older schema; rebuild it.
+  // Check the tables first so that every later query error is operational.
+  const tables = await api.query<{ name: string }>(
+    id,
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('metadata', 'blocks', 'records')",
+  );
+  if (tables.length !== 3) return undefined;
+  // `*` also reads schema 2 metadata, which has no patch_from column.
+  const [row] = await api.query<{ data: string; ready: number; patch_from?: string | null }>(
+    id,
+    "SELECT * FROM metadata WHERE id = 1",
+  );
+  let metadata: Partial<ReleaseMetadata> | undefined;
   try {
-    const [row] = await api.query<{ data: string; ready: number; patch_from: string | null }>(
-      id,
-      "SELECT data, ready, patch_from FROM metadata WHERE id = 1",
-    );
-    const metadata = JSON.parse(row!.data) as Partial<ReleaseMetadata>;
-    const from =
-      row!.ready === 1
-        ? metadata.version
-        : metadata.version === version
-          ? row!.patch_from
-          : undefined;
-    return metadata.schemaVersion === D1_SCHEMA_VERSION &&
-      typeof from === "string" &&
-      /^[a-f0-9]{64}$/.test(from)
-      ? from
-      : undefined;
+    metadata = row && JSON.parse(row.data);
   } catch {
     return undefined;
   }
+  if (
+    metadata?.schemaVersion !== D1_SCHEMA_VERSION ||
+    !(now - Date.parse(metadata.updatedAt ?? "") < MAX_BASE_AGE_MS)
+  )
+    return undefined;
+  const from =
+    row!.ready === 1 ? metadata.version : metadata.version === version ? row!.patch_from : null;
+  return typeof from === "string" && /^[a-f0-9]{64}$/.test(from) ? from : undefined;
+}
+
+// A publisher leases the inactive slot from its first write until deploy, so
+// CI and local publishers cannot interleave SQL in one slot. Full imports drop
+// only the release tables, so the lease survives them. An abandoned lease
+// expires after the CI job timeout.
+const LEASE_MS = 2 * 60 * 60 * 1000;
+export async function acquireLease(api: Cloudflare, id: string, owner: string, now = Date.now()) {
+  await api.query(
+    id,
+    "CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK(id = 1), owner TEXT NOT NULL, expires INTEGER NOT NULL)",
+  );
+  // One atomic statement: take a free or expired lease, or renew our own.
+  const held = await api.query(
+    id,
+    "INSERT INTO lease VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, expires = excluded.expires WHERE lease.owner = excluded.owner OR lease.expires < ? RETURNING owner",
+    [owner, now + LEASE_MS, now],
+  );
+  if (held.length !== 1)
+    throw new SafeError(
+      "Another publisher holds the inactive D1 slot; retry after it finishes or its lease expires",
+    );
+}
+export async function releaseLease(api: Cloudflare, id: string, owner: string) {
+  await api.query(id, "DELETE FROM lease WHERE owner = ?", [owner]);
+}
+/** Mark the slot ready, but only while this publisher still holds its lease. */
+export async function activate(api: Cloudflare, id: string, owner: string) {
+  const rows = await api.query(
+    id,
+    "UPDATE metadata SET ready = 1, patch_from = NULL WHERE id = 1 AND EXISTS (SELECT 1 FROM lease WHERE owner = ?) RETURNING id",
+    [owner],
+  );
+  if (rows.length !== 1) throw new SafeError("Lost the D1 slot lease before activation");
 }
 
 export async function readyRelease(api: Cloudflare, id: string, version: string): Promise<boolean> {

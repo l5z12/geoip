@@ -25,8 +25,16 @@ export const PROBES = [
 // does not keep paying for that storage.
 export const RESET_SQL =
   "DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS ranges; DROP TABLE IF EXISTS blocks; DROP TABLE IF EXISTS records;";
-export const COUNTS_SQL =
-  "SELECT (SELECT COUNT(*) FROM blocks) AS blocks, (SELECT COUNT(*) FROM records) AS records";
+// One scan per table. Block hashes and record ids both derive from row
+// content, so matching sums show every row matches, not just the row counts.
+export const CHECKSUM_SQL =
+  "SELECT b.blocks, b.blockHash, r.records, r.recordHash FROM (SELECT COUNT(*) AS blocks, COALESCE(SUM(hash), 0) AS blockHash FROM blocks) AS b, (SELECT COUNT(*) AS records, COALESCE(SUM(id % 4294967296), 0) AS recordHash FROM records) AS r";
+export interface Checksum {
+  blocks: number;
+  blockHash: number;
+  records: number;
+  recordHash: number;
+}
 // Block boundaries are content-defined: once a block holds BLOCK_MIN_RANGES,
 // a range whose start hashes to a cut point (1 in BLOCK_CUT_ODDS) opens the
 // next one, about 64 ranges per block on average. Inserting or removing a range
@@ -35,10 +43,8 @@ export const COUNTS_SQL =
 export const BLOCK_MIN_RANGES = 32;
 export const BLOCK_CUT_ODDS = 32;
 export const BLOCK_MAX_RANGES = 256;
-export interface BuildStats {
+export interface BuildStats extends Checksum {
   ranges: number;
-  blocks: number;
-  records: number;
   bytes: number;
   path: string;
   probes: LookupRow[][];
@@ -92,12 +98,21 @@ export async function addDatabase(
   });
   const insertRecord = db.prepare("INSERT INTO records VALUES (?, ?)");
   const findRecord = db.prepare("SELECT data FROM records WHERE id = ?");
-  const insertBlock = db.prepare("INSERT INTO blocks VALUES (?, ?, ?, ?)");
+  const insertBlock = db.prepare("INSERT INTO blocks VALUES (?, ?, ?, ?, ?)");
   // Ranges arrive sorted by start within each family, IPv4 first.
   let block: [string, string, number, number][] = [],
     blockFamily = 0;
   function flush() {
-    if (block.length) insertBlock.run(kind, blockFamily, block[0]![0], JSON.stringify(block));
+    if (block.length) {
+      const data = JSON.stringify(block);
+      insertBlock.run(
+        kind,
+        blockFamily,
+        block[0]![0],
+        parseInt(sha256(data).slice(0, 8), 16),
+        data,
+      );
+    }
     block = [];
   }
   // Ids hash the record content rather than its MMDB offset, which shifts on
@@ -261,7 +276,7 @@ const REMOVED_RECORDS =
 const CHANGED_RECORDS =
   "SELECT t.id, t.data FROM main.records AS t LEFT JOIN base.records AS b ON b.id = t.id WHERE b.data IS NOT t.data";
 const CHANGED_BLOCKS =
-  "SELECT t.kind, t.family, t.start, t.data FROM main.blocks AS t LEFT JOIN base.blocks AS b ON b.kind = t.kind AND b.family = t.family AND b.start = t.start WHERE b.data IS NOT t.data";
+  "SELECT t.* FROM main.blocks AS t LEFT JOIN base.blocks AS b ON b.kind = t.kind AND b.family = t.family AND b.start = t.start WHERE b.data IS NOT t.data";
 
 /** Patch a slot holding release `from`, whose local build is `base`, into
  * `build`. Returns undefined when a full import would write no more rows. */
@@ -310,7 +325,7 @@ export async function patchImport(
       await sql.batch(
         "INSERT INTO blocks VALUES ",
         tuples(db, CHANGED_BLOCKS),
-        " ON CONFLICT(kind, family, start) DO UPDATE SET data = excluded.data",
+        " ON CONFLICT(kind, family, start) DO UPDATE SET hash = excluded.hash, data = excluded.data",
       );
       await sql.flush();
     } finally {
@@ -352,18 +367,18 @@ export async function buildD1(
           "D1 build exceeds D1_MAX_BYTES; check your account limit before increasing it",
         );
     }
-    const counts = db.prepare(COUNTS_SQL).get() as { blocks: number; records: number };
+    const checksum = { ...(db.prepare(CHECKSUM_SQL).get() as unknown as Checksum) };
     const { ranges } = db
       .prepare("SELECT COALESCE(SUM(json_array_length(data)), 0) AS ranges FROM blocks")
       .get() as { ranges: number };
     const bytes = (await stat(path)).size;
-    if (!counts.blocks || !counts.records || bytes > maxBytes)
+    if (!checksum.blocks || !checksum.records || bytes > maxBytes)
       throw new SafeError("D1 build is empty or exceeds capacity");
     const probes = PROBES.map((ip) => localLookup(db, ip));
     console.log(
-      `D1 build: ${ranges} ranges in ${counts.blocks} blocks, ${counts.records} records, ${bytes} bytes`,
+      `D1 build: ${ranges} ranges in ${checksum.blocks} blocks, ${checksum.records} records, ${bytes} bytes`,
     );
-    return { ranges, ...counts, bytes, path, probes };
+    return { ranges, ...checksum, bytes, path, probes };
   } finally {
     db.close();
   }

@@ -8,13 +8,15 @@ export const D1_SCHEMA_VERSION = 3;
 // as a JSON array of [start, end, prefix, record_id], so a full import writes
 // far fewer rows than one row per MMDB leaf. Record ids and block boundaries
 // derive from content, so an update patches only rows that changed.
-// `patch_from` names the release an unfinished patch started from.
+// `patch_from` names the release an unfinished patch started from. A block's
+// `hash` (32 bits of the SHA-256 of `data`) precedes `data` so checksums of a
+// whole slot never read the JSON.
 export const D1_SCHEMA = `
 CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL, ready INTEGER NOT NULL CHECK(ready IN (0,1)), patch_from TEXT);
 CREATE TABLE records (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE blocks (
   kind INTEGER NOT NULL, family INTEGER NOT NULL, start TEXT NOT NULL COLLATE BINARY,
-  data TEXT NOT NULL,
+  hash INTEGER NOT NULL, data TEXT NOT NULL,
   PRIMARY KEY (kind, family, start)
 ) WITHOUT ROWID;
 `;

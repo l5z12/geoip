@@ -6,7 +6,7 @@ const db = new DatabaseSync(":memory:");
 try {
   db.exec(D1_SCHEMA);
   db.exec("INSERT INTO metadata VALUES (1, '{}', 1, NULL); INSERT INTO records VALUES (1, '{}')");
-  const insert = db.prepare("INSERT INTO blocks VALUES (?, 4, ?, ?)");
+  const insert = db.prepare("INSERT INTO blocks VALUES (?, 4, ?, 0, ?)");
   db.exec("BEGIN");
   let block: [string, string, number, number][] = [],
     blocks = 0;

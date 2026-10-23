@@ -31,7 +31,7 @@ test("IPv4/IPv6 predecessor seeks check the end and preserve gaps and exact boun
   const db = await d1Fixture();
   db.sql.exec("DELETE FROM blocks");
   const record = db.sql.prepare("SELECT id FROM records ORDER BY id LIMIT 1").get()!.id;
-  const insert = db.sql.prepare("INSERT INTO blocks VALUES (0, ?, ?, ?)");
+  const insert = db.sql.prepare("INSERT INTO blocks VALUES (0, ?, ?, 0, ?)");
   const block = (family: 4 | 6, ranges: [string, string, number][]) =>
     insert.run(
       family,
