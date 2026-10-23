@@ -88,12 +88,17 @@ export async function validateLocal(dataDir = DATA_DIR): Promise<Manifest> {
     throw new SafeError("Manifest version or update time differs from database builds");
   return manifest;
 }
-export function publicationPlan(manifest: Manifest): { key: string; file: string }[] {
-  return [
-    ...DATABASE_KINDS.map((kind) => ({ key: manifest.files[kind].key, file: `${kind}.mmdb` })),
-    { key: `versions/${manifest.version}/manifest.json`, file: "manifest.json" },
-    { key: "manifest.json", file: "manifest.json" },
-  ];
+/** The versioned archive is uploaded before D1 is touched: any slot that
+ * becomes ready must have its release in R2 to serve as the next patch base.
+ * The archive pointer goes last, after D1 validation. */
+export function publicationPlan(manifest: Manifest) {
+  return {
+    archive: [
+      ...DATABASE_KINDS.map((kind) => ({ key: manifest.files[kind].key, file: `${kind}.mmdb` })),
+      { key: `versions/${manifest.version}/manifest.json`, file: "manifest.json" },
+    ],
+    pointer: { key: "manifest.json", file: "manifest.json" },
+  };
 }
 export async function runWrangler(args: string[]): Promise<boolean> {
   // Launch the installed CLI with Node directly: no shell or platform-specific
@@ -243,7 +248,26 @@ export async function main(): Promise<void> {
   const config = await projectConfig();
   let prepared: PreparedRelease | undefined;
   let release: (() => Promise<void>) | undefined;
+  const plan = publicationPlan(manifest);
+  async function upload(items: { key: string; file: string }[]) {
+    for (const item of items) {
+      const succeeded = await runWrangler([
+        "r2",
+        "object",
+        "put",
+        `${bucket}/${item.key}`,
+        "--file",
+        fileURLToPath(new URL(item.file, DATA_DIR)),
+        mode,
+      ]);
+      if (!succeeded)
+        throw new SafeError(
+          `R2 upload failed for ${item.key}; active manifest was not advanced unless its final upload succeeded`,
+        );
+    }
+  }
   try {
+    await upload(plan.archive);
     if (mode === "--local") {
       const { files } = await fullImport(await buildD1(manifest));
       for (const file of files) {
@@ -309,21 +333,7 @@ export async function main(): Promise<void> {
         ...(lease ? { lease } : {}),
       };
     }
-    for (const item of publicationPlan(manifest)) {
-      const succeeded = await runWrangler([
-        "r2",
-        "object",
-        "put",
-        `${bucket}/${item.key}`,
-        "--file",
-        fileURLToPath(new URL(item.file, DATA_DIR)),
-        mode,
-      ]);
-      if (!succeeded)
-        throw new SafeError(
-          `R2 upload failed for ${item.key}; active manifest was not advanced unless its final upload succeeded`,
-        );
-    }
+    await upload([plan.pointer]);
     if (prepared) await writeFile(RELEASE_STATE, JSON.stringify(prepared) + "\n");
   } catch (error) {
     // Let the next publisher in now rather than when the lease expires. On
