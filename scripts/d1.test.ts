@@ -1,7 +1,7 @@
 import { expect, test, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { Reader } from "mmdb-lib";
-import { mkdtemp, readFile, unlink, rmdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,13 +10,17 @@ import {
   buildD1,
   capacityLimit,
   exportSql,
+  fullImport,
   localLookup,
+  patchImport,
   rowLimit,
   sqlValue,
+  startsBlock,
+  BLOCK_MAX_RANGES,
   PROBES,
   type BuildStats,
 } from "./build-d1";
-import { chooseSlot, Cloudflare, readyRelease, validateRemote } from "./d1-release";
+import { chooseSlot, Cloudflare, patchBase, readyRelease, validateRemote } from "./d1-release";
 import { D1_SCHEMA, releaseMetadata } from "../src/d1-schema";
 import { DATABASE_KINDS } from "../src/manifest";
 import { dataset, treeMmdb } from "../tests/fixtures";
@@ -112,28 +116,32 @@ test("full build validates probes, reports size, and exports an unready release"
   const dir = await mkdtemp(join(tmpdir(), "geoip-d1-build-"));
   const url = pathToFileURL(dir + "/"),
     data = dataset();
-  let build: BuildStats | undefined;
+  let files: string[] = [];
   try {
     for (const kind of DATABASE_KINDS) await writeFile(new URL(`${kind}.mmdb`, url), data[kind]);
-    build = await buildD1(data.manifest, url);
+    const build = await buildD1(data.manifest, url);
     expect(build.ranges).toBe(6);
     expect(build.blocks).toBe(6);
     expect(build.records).toBe(3);
     expect(build.bytes).toBeGreaterThan(0);
+    ({ files } = await fullImport(build, url));
     const restored = new DatabaseSync(":memory:");
     try {
-      for (const file of build.files) restored.exec(await readFile(file, "utf8"));
-      expect(restored.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
+      for (const file of files) restored.exec(await readFile(file, "utf8"));
+      expect(restored.prepare("SELECT ready, patch_from FROM metadata").get()).toEqual({
+        ready: 0,
+        patch_from: null,
+      });
     } finally {
       restored.close();
     }
     await expect(buildD1(data.manifest, url, 1)).rejects.toThrow("D1_MAX_BYTES");
     // 6 blocks + 3 records + the metadata insert and its `ready` UPDATE.
-    await expect(buildD1(data.manifest, url, undefined, 10)).rejects.toThrow(
-      "D1 build would write 11 rows, above D1_MAX_ROWS=10",
+    await expect(fullImport(build, url, 10)).rejects.toThrow(
+      "D1 import would write 11 rows, above D1_MAX_ROWS=10",
     );
   } finally {
-    for (const file of build?.files ?? []) await unlink(file);
+    for (const file of files) await unlink(file);
     for (const kind of DATABASE_KINDS) await unlink(new URL(`${kind}.mmdb`, url));
     await unlink(new URL("lookup.sqlite", url));
     await rmdir(dir);
@@ -145,6 +153,131 @@ test("full build validates probes, reports size, and exports an unready release"
   expect(rowLimit("250000")).toBe(250000);
   for (const value of ["0", "-1", "100000001", "1.5", "NaN"])
     expect(() => rowLimit(value)).toThrow();
+});
+
+test("an inserted or removed range moves only nearby block boundaries", () => {
+  const key = (value: number) => (0x08000000 + value).toString(16).padStart(8, "0");
+  function boundaries(starts: string[]) {
+    const result: string[] = [];
+    let length = 0;
+    for (const start of starts) {
+      if (!result.length || startsBlock(start, length)) {
+        result.push(start);
+        length = 0;
+      }
+      length++;
+    }
+    return result;
+  }
+  const starts = Array.from({ length: 20_000 }, (_, i) => key(i * 4));
+  const before = boundaries(starts);
+  // About 64 ranges per block, as with the previous fixed-size blocks.
+  expect(starts.length / before.length).toBeGreaterThan(48);
+  expect(starts.length / before.length).toBeLessThan(80);
+  for (const edited of [
+    [...starts.slice(0, 7_000), key(27_998), ...starts.slice(7_000)],
+    [...starts.slice(0, 7_000), ...starts.slice(7_001)],
+  ]) {
+    const after = boundaries(edited);
+    const moved =
+      before.filter((start) => !after.includes(start)).length +
+      after.filter((start) => !before.includes(start)).length;
+    expect(moved).toBeLessThanOrEqual(4);
+  }
+  expect(startsBlock(key(0), BLOCK_MAX_RANGES)).toBe(true);
+});
+
+test("a patch turns the slot's release into the new build and is safe to rerun", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "geoip-d1-patch-"));
+  const url = pathToFileURL(dir + "/"),
+    baseUrl = new URL("base/", url),
+    epoch = Math.floor(Date.now() / 1000);
+  const asn = (number: number) => ({
+    autonomous_system_number: number,
+    autonomous_system_organization: `Network ${number}`,
+  });
+  const before = dataset(epoch, { asn: asn(64512) }),
+    after = dataset(epoch, { asn: asn(64513) });
+  const restored = new DatabaseSync(":memory:");
+  try {
+    await mkdir(baseUrl);
+    for (const kind of DATABASE_KINDS) {
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), before[kind]);
+      await writeFile(new URL(`${kind}.mmdb`, url), after[kind]);
+    }
+    const base = await buildD1(before.manifest, baseUrl);
+    const build = await buildD1(after.manifest, url);
+    for (const file of (await fullImport(base, baseUrl)).files)
+      restored.exec(await readFile(file, "utf8"));
+    restored.exec("UPDATE metadata SET ready = 1");
+    const patch = (await patchImport(build, base, before.manifest.version, url))!;
+    // The ASN record is replaced and its IPv4 and IPv6 blocks rewritten; the
+    // Country and City rows are untouched although their MMDB files differ.
+    expect(patch.rows).toBe(1 + 1 + 2 + 2);
+    expect(patch.from).toBe(before.manifest.version);
+    const expected = new DatabaseSync(build.path, { readOnly: true });
+    try {
+      // The second pass reruns a patch over its own result, as after an
+      // interrupted import.
+      for (let pass = 0; pass < 2; pass++) {
+        for (const file of patch.files) restored.exec(await readFile(file, "utf8"));
+        for (const query of [
+          "SELECT * FROM records ORDER BY id",
+          "SELECT * FROM blocks ORDER BY kind, family, start",
+        ])
+          expect(restored.prepare(query).all()).toEqual(expected.prepare(query).all());
+        expect(restored.prepare("SELECT data, ready, patch_from FROM metadata").get()).toEqual({
+          data: expected.prepare("SELECT data FROM metadata").get()!.data,
+          ready: 0,
+          patch_from: before.manifest.version,
+        });
+      }
+    } finally {
+      expected.close();
+    }
+    await expect(patchImport(build, base, before.manifest.version, url, 5)).rejects.toThrow(
+      "D1 import would write 6 rows, above D1_MAX_ROWS=5",
+    );
+    // When every record changes, a full import writes fewer rows.
+    const unrelated = dataset(epoch, {
+      country: { country: { iso_code: "CA" } },
+      city: { country: { iso_code: "CA" } },
+      asn: asn(64514),
+    });
+    for (const kind of DATABASE_KINDS)
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), unrelated[kind]);
+    const other = await buildD1(unrelated.manifest, baseUrl);
+    expect(await patchImport(build, other, unrelated.manifest.version, url)).toBeUndefined();
+  } finally {
+    restored.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("only a ready slot or an interrupted patch toward the same release is patched", async () => {
+  const request = vi.fn<typeof fetch>();
+  const api = new Cloudflare("account", "secret", request);
+  const data = dataset();
+  const metadata = releaseMetadata(data.manifest);
+  const [from, other] = ["b".repeat(64), "c".repeat(64)];
+  const row = (ready: number, patch_from: string | null, value: object = metadata) =>
+    Response.json({
+      success: true,
+      result: [{ success: true, results: [{ data: JSON.stringify(value), ready, patch_from }] }],
+    });
+  request.mockResolvedValueOnce(row(1, null));
+  expect(await patchBase(api, "inactive", other)).toBe(data.manifest.version);
+  request.mockResolvedValueOnce(row(0, from));
+  expect(await patchBase(api, "inactive", data.manifest.version)).toBe(from);
+  request.mockResolvedValueOnce(row(0, from));
+  expect(await patchBase(api, "inactive", other)).toBeUndefined();
+  request.mockResolvedValueOnce(row(0, null));
+  expect(await patchBase(api, "inactive", data.manifest.version)).toBeUndefined();
+  request.mockResolvedValueOnce(row(1, null, { ...metadata, schemaVersion: 2 }));
+  expect(await patchBase(api, "inactive", other)).toBeUndefined();
+  // Schema 2 slots have no patch_from column, so the query itself fails.
+  request.mockResolvedValueOnce(new Response(null, { status: 400 }));
+  expect(await patchBase(api, "inactive", other)).toBeUndefined();
 });
 
 test("slot selection never selects the live database or accepts an unmanaged live binding", () => {
@@ -190,7 +323,7 @@ test("remote validation rejects partial imports and probe mismatches before acti
     blocks: 6,
     records: 3,
     bytes: 1000,
-    files: [],
+    path: "",
     probes: PROBES.map(() => [{ kind: 0, prefix: 24, data: "{}" }]),
   };
   const result = (results: unknown[]) =>

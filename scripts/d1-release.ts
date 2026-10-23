@@ -5,6 +5,7 @@ import {
   STATUS_SQL,
   addressKey,
   type LookupRow,
+  type ReleaseMetadata,
 } from "../src/d1-schema";
 import { readMetadata } from "../src/database";
 import { COUNTS_SQL, PROBES, type BuildStats } from "./build-d1";
@@ -163,6 +164,36 @@ export async function validateRemote(api: Cloudflare, id: string, build: BuildSt
       );
     if (normalize(rows) !== normalize(build.probes[index]!))
       throw new SafeError("D1 imported records differ from the validated build");
+  }
+}
+
+/** The release an inactive slot can be patched from: its ready release, or the
+ * base of an interrupted patch toward `version`. Anything else is rebuilt. */
+export async function patchBase(
+  api: Cloudflare,
+  id: string,
+  version: string,
+): Promise<string | undefined> {
+  // A missing table or column means an older schema; rebuild it.
+  try {
+    const [row] = await api.query<{ data: string; ready: number; patch_from: string | null }>(
+      id,
+      "SELECT data, ready, patch_from FROM metadata WHERE id = 1",
+    );
+    const metadata = JSON.parse(row!.data) as Partial<ReleaseMetadata>;
+    const from =
+      row!.ready === 1
+        ? metadata.version
+        : metadata.version === version
+          ? row!.patch_from
+          : undefined;
+    return metadata.schemaVersion === D1_SCHEMA_VERSION &&
+      typeof from === "string" &&
+      /^[a-f0-9]{64}$/.test(from)
+      ? from
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -29,7 +29,7 @@ try {
   sql.exec(D1_SCHEMA);
   for (const [index, kind] of DATABASE_KINDS.entries()) await addDatabase(sql, index, data[kind]);
   sql
-    .prepare("INSERT INTO metadata VALUES (1, ?, 0)")
+    .prepare("INSERT INTO metadata VALUES (1, ?, 0, NULL)")
     .run(JSON.stringify(releaseMetadata(data.manifest)));
   files = await exportSql(sql, pathToFileURL(directory + "/"));
   const d1 = await runtime.getD1Database("GEOIP_LOOKUP");

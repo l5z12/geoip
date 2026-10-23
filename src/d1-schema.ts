@@ -3,12 +3,14 @@ import { DATABASE_KINDS, databaseInfo, type Manifest } from "./manifest";
 
 // Bump when the SQL layout or conversion semantics change. Identical MaxMind
 // releases must still be rebuilt when the converter changes.
-export const D1_SCHEMA_VERSION = 2;
+export const D1_SCHEMA_VERSION = 3;
 // D1 bills every inserted row. Each block row holds a run of consecutive ranges
 // as a JSON array of [start, end, prefix, record_id], so a full import writes
-// far fewer rows than one row per MMDB leaf.
+// far fewer rows than one row per MMDB leaf. Record ids and block boundaries
+// derive from content, so an update patches only rows that changed.
+// `patch_from` names the release an unfinished patch started from.
 export const D1_SCHEMA = `
-CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL, ready INTEGER NOT NULL CHECK(ready IN (0,1)));
+CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), data TEXT NOT NULL, ready INTEGER NOT NULL CHECK(ready IN (0,1)), patch_from TEXT);
 CREATE TABLE records (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE blocks (
   kind INTEGER NOT NULL, family INTEGER NOT NULL, start TEXT NOT NULL COLLATE BINARY,

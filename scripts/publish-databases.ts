@@ -1,11 +1,12 @@
-import { readFile, stat, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { buildD1 } from "./build-d1";
+import { buildD1, fullImport, patchImport, type BuildStats } from "./build-d1";
 import {
   Cloudflare,
   chooseSlot,
+  patchBase,
   projectConfig,
   readyRelease,
   RELEASE_CONFIG,
@@ -106,6 +107,70 @@ export async function runWrangler(args: string[]): Promise<boolean> {
     child.once("close", (code) => resolve(code === 0));
   });
 }
+export const BASE_DIR = new URL("base/", DATA_DIR);
+/** Download an archived release's MMDBs and check them against its manifest. */
+export async function fetchRelease(
+  bucket: string,
+  version: string,
+  dir = BASE_DIR,
+): Promise<Manifest | undefined> {
+  await rm(dir, { recursive: true, force: true });
+  await mkdir(dir, { recursive: true });
+  const get = (key: string, file: string) =>
+    runWrangler([
+      "r2",
+      "object",
+      "get",
+      `${bucket}/${key}`,
+      "--file",
+      fileURLToPath(new URL(file, dir)),
+      "--remote",
+    ]);
+  try {
+    const path = new URL("manifest.json", dir);
+    if (
+      !(await get(`versions/${version}/manifest.json`, "manifest.json")) ||
+      (await stat(path)).size > MAX_MANIFEST_BYTES
+    )
+      return undefined;
+    const manifest = parseManifest(JSON.parse(await readFile(path, "utf8")));
+    for (const kind of DATABASE_KINDS) {
+      const file = manifest.files[kind];
+      if (
+        !(await get(file.key, `${kind}.mmdb`)) ||
+        sha256(await readFile(new URL(`${kind}.mmdb`, dir))) !== file.sha256
+      )
+        return undefined;
+    }
+    const digests = Object.fromEntries(
+      DATABASE_KINDS.map((kind) => [kind, manifest.files[kind].sha256]),
+    ) as Record<DatabaseKind, string>;
+    return manifest.version === version && versionFor(digests) === version ? manifest : undefined;
+  } catch {
+    return undefined;
+  }
+}
+/** Diff against the release the slot holds, rebuilt locally from its archive. */
+async function slotPatch(
+  api: Cloudflare,
+  bucket: string,
+  id: string,
+  build: BuildStats,
+  version: string,
+) {
+  const from = await patchBase(api, id, version);
+  if (!from) {
+    console.log("Inactive D1 slot holds no patchable release; importing in full");
+    return undefined;
+  }
+  const manifest = await fetchRelease(bucket, from);
+  if (!manifest) {
+    console.log(`Archived release ${from} is unavailable; importing in full`);
+    return undefined;
+  }
+  console.log(`Rebuilding slot release ${from} locally to diff against`);
+  return patchImport(build, await buildD1(manifest, BASE_DIR), from);
+}
 export async function main(): Promise<void> {
   const mode = publishMode(process.argv.slice(2));
   // Never leave an old deployment receipt usable after a failed new build.
@@ -115,8 +180,8 @@ export async function main(): Promise<void> {
   const config = await projectConfig();
   let prepared: PreparedRelease | undefined;
   if (mode === "--local") {
-    const build = await buildD1(manifest);
-    for (const file of build.files) {
+    const { files } = await fullImport(await buildD1(manifest));
+    for (const file of files) {
       if (
         !(await runWrangler(["d1", "execute", "GEOIP_LOOKUP", "--local", "--file", file, "--yes"]))
       )
@@ -153,25 +218,39 @@ export async function main(): Promise<void> {
       if (target.uuid === active || (await api.activeDatabase(config.name)) !== active)
         throw new SafeError("Live binding changed; refusing to import into D1");
       await writeReleaseConfig(config, target, manifest.version);
-      for (const [index, file] of build.files.entries()) {
-        console.log(`Importing D1 file ${index + 1}/${build.files.length} into ${target.name}`);
-        if (
-          !(await runWrangler([
-            "d1",
-            "execute",
-            "GEOIP_LOOKUP",
-            "--config",
-            fileURLToPath(RELEASE_CONFIG),
-            "--remote",
-            "--file",
-            file,
-            "--yes",
-          ]))
-        )
-          throw new SafeError("Staging D1 import failed; live binding was not changed");
+      const importFiles = async (files: string[]) => {
+        for (const [index, file] of files.entries()) {
+          console.log(`Importing D1 file ${index + 1}/${files.length} into ${target.name}`);
+          if (
+            !(await runWrangler([
+              "d1",
+              "execute",
+              "GEOIP_LOOKUP",
+              "--config",
+              fileURLToPath(RELEASE_CONFIG),
+              "--remote",
+              "--file",
+              file,
+              "--yes",
+            ]))
+          )
+            throw new SafeError("Staging D1 import failed; live binding was not changed");
+        }
+      };
+      const patch = slot.existing
+        ? await slotPatch(api, bucket, target.uuid, build, manifest.version)
+        : undefined;
+      await importFiles((patch ?? (await fullImport(build))).files);
+      try {
+        await validateRemote(api, target.uuid, build);
+      } catch (error) {
+        if (!patch) throw error;
+        // The slot did not hold exactly its recorded release; rebuild it.
+        console.log("Patched D1 failed validation; importing in full");
+        await importFiles((await fullImport(build)).files);
+        await validateRemote(api, target.uuid, build);
       }
-      await validateRemote(api, target.uuid, build);
-      await api.query(target.uuid, "UPDATE metadata SET ready = 1 WHERE id = 1");
+      await api.query(target.uuid, "UPDATE metadata SET ready = 1, patch_from = NULL WHERE id = 1");
       if (!(await readyRelease(api, target.uuid, manifest.version)))
         throw new SafeError("D1 release validation failed");
     }
