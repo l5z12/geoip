@@ -321,6 +321,11 @@ export async function main(): Promise<void> {
         await acquireLease(api, id, owner);
         lease = owner;
         release = () => releaseLease(api, id, owner);
+        // Deploy keeps the lease until its slot is live, so another publisher
+        // may have made this slot live just before we took the lease; once we
+        // hold it, the binding cannot move here.
+        if ((await api.activeDatabase(config.name)) !== active)
+          throw new SafeError("Live binding changed; refusing to import into D1");
         await stageSlot(api, bucket, target, !!slot.existing, owner, build, manifest.version);
       }
       prepared = {
