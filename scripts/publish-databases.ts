@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile, rm } from "node:fs/promises";
+import { readFile, stat, writeFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -9,8 +9,9 @@ import {
   activate,
   Cloudflare,
   chooseSlot,
+  copySlot,
   MismatchError,
-  patchBase,
+  patchable,
   projectConfig,
   readyRelease,
   releaseLease,
@@ -88,9 +89,9 @@ export async function validateLocal(dataDir = DATA_DIR): Promise<Manifest> {
     throw new SafeError("Manifest version or update time differs from database builds");
   return manifest;
 }
-/** The versioned archive is uploaded before D1 is touched: any slot that
- * becomes ready must have its release in R2 to serve as the next patch base.
- * The archive pointer goes last, after D1 validation. */
+/** The versioned archive is uploaded before D1 is touched, so every release
+ * that can go live is recoverable from R2. The archive pointer goes last,
+ * after D1 validation. */
 export function publicationPlan(manifest: Manifest) {
   return {
     archive: [
@@ -117,86 +118,21 @@ export async function runWrangler(args: string[]): Promise<boolean> {
     child.once("close", (code) => resolve(code === 0));
   });
 }
-export const BASE_DIR = new URL("base/", DATA_DIR);
-/** Download an archived release's MMDBs. Returns undefined when they do not
- * match its manifest; a failed download throws, since retrying may succeed. */
-export async function fetchRelease(
-  bucket: string,
-  version: string,
-  dir = BASE_DIR,
-): Promise<Manifest | undefined> {
-  await rm(dir, { recursive: true, force: true });
-  await mkdir(dir, { recursive: true });
-  async function get(key: string, file: string) {
-    const path = new URL(file, dir);
-    if (
-      !(await runWrangler([
-        "r2",
-        "object",
-        "get",
-        `${bucket}/${key}`,
-        "--file",
-        fileURLToPath(path),
-        "--remote",
-      ]))
-    )
-      throw new SafeError(`R2 download failed for ${key}; D1 was not changed`);
-    return path;
-  }
-  const path = await get(`versions/${version}/manifest.json`, "manifest.json");
-  let manifest: Manifest;
-  try {
-    if ((await stat(path)).size > MAX_MANIFEST_BYTES) return undefined;
-    manifest = parseManifest(JSON.parse(await readFile(path, "utf8")));
-  } catch {
+const SLOT_COPY = new URL("slot.sqlite", DATA_DIR);
+/** Diff against a copy of the slot's actual rows. Returns undefined when only
+ * a full import can bring the slot up to date. */
+async function slotPatch(api: Cloudflare, id: string, build: BuildStats) {
+  if (!(await patchable(api, id))) {
+    console.log("Inactive D1 slot does not have this schema's tables; importing in full");
     return undefined;
   }
-  if (manifest.version !== version) return undefined;
-  for (const kind of DATABASE_KINDS) {
-    const file = manifest.files[kind];
-    if (sha256(await readFile(await get(file.key, `${kind}.mmdb`))) !== file.sha256)
-      return undefined;
-  }
-  const digests = Object.fromEntries(
-    DATABASE_KINDS.map((kind) => [kind, manifest.files[kind].sha256]),
-  ) as Record<DatabaseKind, string>;
-  return versionFor(digests) === version ? manifest : undefined;
-}
-/** Diff against the release the slot holds, rebuilt locally from its archive.
- * Returns undefined when only a full import can bring the slot up to date. */
-async function slotPatch(
-  api: Cloudflare,
-  bucket: string,
-  id: string,
-  build: BuildStats,
-  version: string,
-) {
-  const from = await patchBase(api, id, version);
-  if (!from) {
-    console.log("Inactive D1 slot holds no patchable release; importing in full");
-    return undefined;
-  }
-  const manifest = await fetchRelease(bucket, from);
-  if (!manifest) {
-    console.log(`Archived release ${from} does not match its manifest; importing in full`);
-    return undefined;
-  }
-  console.log(`Rebuilding slot release ${from} locally to diff against`);
-  try {
-    return await patchImport(build, await buildD1(manifest, BASE_DIR), from);
-  } catch (error) {
-    // The archive passed its hashes, so a rejected rebuild fails the same way
-    // on every rerun; other errors are operational and stop publishing.
-    if (!(error instanceof SafeError)) throw error;
-    console.log(`Could not rebuild release ${from} to diff against; importing in full`);
-    return undefined;
-  }
+  console.log("Copying the inactive D1 slot to diff against");
+  return patchImport(build, await copySlot(api, id, fileURLToPath(SLOT_COPY)));
 }
 /** Bring the leased inactive slot to `build`, patching when possible, and mark
  * it ready only once its rows match the build. */
 async function stageSlot(
   api: Cloudflare,
-  bucket: string,
   target: D1Info,
   existing: boolean,
   lease: string,
@@ -224,13 +160,13 @@ async function stageSlot(
         throw new SafeError("Staging D1 import failed; live binding was not changed");
     }
   };
-  const patch = existing ? await slotPatch(api, bucket, target.uuid, build, version) : undefined;
+  const patch = existing ? await slotPatch(api, target.uuid, build) : undefined;
   await importFiles((patch ?? (await fullImport(build))).files);
   try {
     await validateRemote(api, target.uuid, build);
   } catch (error) {
     if (!patch || !(error instanceof MismatchError)) throw error;
-    // The slot did not hold exactly its recorded release; rebuild it.
+    // The slot changed after it was copied; rebuild it.
     console.log("Patched D1 differs from the new build; importing in full");
     await importFiles((await fullImport(build)).files);
     await validateRemote(api, target.uuid, build);
@@ -326,7 +262,7 @@ export async function main(): Promise<void> {
         // hold it, the binding cannot move here.
         if ((await api.activeDatabase(config.name)) !== active)
           throw new SafeError("Live binding changed; refusing to import into D1");
-        await stageSlot(api, bucket, target, !!slot.existing, owner, build, manifest.version);
+        await stageSlot(api, target, !!slot.existing, owner, build, manifest.version);
       }
       prepared = {
         account: account!,

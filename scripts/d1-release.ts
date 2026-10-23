@@ -1,11 +1,12 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import {
+  D1_SCHEMA,
   D1_SCHEMA_VERSION,
   LOOKUP_SQL,
   STATUS_SQL,
   addressKey,
   type LookupRow,
-  type ReleaseMetadata,
 } from "../src/d1-schema";
 import { readMetadata } from "../src/database";
 import { CHECKSUM_SQL, PROBES, type BuildStats, type Checksum } from "./build-d1";
@@ -172,46 +173,86 @@ export async function validateRemote(api: Cloudflare, id: string, build: BuildSt
   }
 }
 
-// Archive cleanup prunes superseded releases 29 days after upload. Validation
-// accepts builds dated up to 2 days ahead, so `updatedAt` can trail the
-// upload's age by that much; with a day to spare, releases built 26 or more
-// days ago are rebuilt in full rather than patched from a pruned archive.
-export const MAX_BASE_AGE_MS = (29 - 2 - 1) * 24 * 60 * 60 * 1000;
+const layout = (sql: string) =>
+  sql
+    .replace(/\s+/g, " ")
+    .replace(/ ?([(),]) ?/g, "$1")
+    .trim();
+const SCHEMA_TABLES = new Map(
+  D1_SCHEMA.split(";")
+    .filter((sql) => sql.trim())
+    .map((sql) => [/CREATE TABLE (\w+)/.exec(sql)![1]!, layout(sql)]),
+);
 
-/** The release an inactive slot can be patched from: its ready release, or the
- * base of an interrupted patch toward `version`. Undefined means import in
- * full; API failures throw rather than trigger a needless full import. */
-export async function patchBase(
-  api: Cloudflare,
-  id: string,
-  version: string,
-  now = Date.now(),
-): Promise<string | undefined> {
-  // Check the tables first so that every later query error is operational.
-  const tables = await api.query<{ name: string }>(
+/** Whether a slot's tables have exactly this schema's layout, so its rows can
+ * be copied and diffed. Anything else, including an older schema or a missing
+ * table, is imported in full. API failures throw rather than force that. */
+export async function patchable(api: Cloudflare, id: string): Promise<boolean> {
+  const tables = await api.query<{ name: string; sql: string }>(
     id,
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('metadata', 'blocks', 'records')",
+    `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN (${[...SCHEMA_TABLES.keys()].map((name) => `'${name}'`).join(", ")})`,
   );
-  if (tables.length !== 3) return undefined;
-  // `*` also reads schema 2 metadata, which has no patch_from column.
-  const [row] = await api.query<{ data: string; ready: number; patch_from?: string | null }>(
-    id,
-    "SELECT * FROM metadata WHERE id = 1",
+  return (
+    tables.length === SCHEMA_TABLES.size &&
+    tables.every((table) => layout(table.sql) === SCHEMA_TABLES.get(table.name))
   );
-  let metadata: Partial<ReleaseMetadata> | undefined;
-  try {
-    metadata = row && JSON.parse(row.data);
-  } catch {
-    return undefined;
+}
+
+// Rows per page when copying a slot, about 4 MB of JSON each. A run makes a
+// few hundred requests, well inside the API's rate limit.
+export const COPY_PAGES = { records: 5000, blocks: 500 };
+
+/** Copy a slot's records and blocks into a fresh local SQLite file at `path`.
+ * Patches diff against these rows rather than against the release the slot
+ * claims to hold, so drifted or hand-edited rows are rewritten. Each page
+ * seeks by primary key, so D1 reads every row once. */
+export async function copySlot(api: Cloudflare, id: string, path: string, pages = COPY_PAGES) {
+  await rm(path, { force: true });
+  const db = new DatabaseSync(path);
+  // Retry each page a few times: one transient failure among hundreds of
+  // requests should not abort the run.
+  async function page<T>(sql: string, params: (string | number)[]) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await api.query<T>(id, sql, params);
+      } catch (error) {
+        if (attempt === 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      }
+    }
   }
-  if (
-    metadata?.schemaVersion !== D1_SCHEMA_VERSION ||
-    !(now - Date.parse(metadata.updatedAt ?? "") < MAX_BASE_AGE_MS)
-  )
-    return undefined;
-  const from =
-    row!.ready === 1 ? metadata.version : metadata.version === version ? row!.patch_from : null;
-  return typeof from === "string" && /^[a-f0-9]{64}$/.test(from) ? from : undefined;
+  try {
+    db.exec(D1_SCHEMA);
+    const insertRecord = db.prepare("INSERT INTO records VALUES (?, ?)");
+    const insertBlock = db.prepare("INSERT INTO blocks VALUES (?, ?, ?, ?, ?)");
+    for (let after = -1; ;) {
+      const rows = await page<{ id: number; data: string }>(
+        "SELECT id, data FROM records WHERE id > ? ORDER BY id LIMIT ?",
+        [after, pages.records],
+      );
+      db.exec("BEGIN");
+      for (const row of rows) insertRecord.run(row.id, row.data);
+      db.exec("COMMIT");
+      if (rows.length < pages.records) break;
+      after = rows.at(-1)!.id;
+    }
+    type Block = { kind: number; family: number; start: string; hash: number; data: string };
+    for (let after: (string | number)[] = [-1, 0, ""]; ;) {
+      const rows = await page<Block>(
+        "SELECT kind, family, start, hash, data FROM blocks WHERE (kind, family, start) > (?, ?, ?) ORDER BY kind, family, start LIMIT ?",
+        [...after, pages.blocks],
+      );
+      db.exec("BEGIN");
+      for (const row of rows) insertBlock.run(row.kind, row.family, row.start, row.hash, row.data);
+      db.exec("COMMIT");
+      if (rows.length < pages.blocks) break;
+      const last = rows.at(-1)!;
+      after = [last.kind, last.family, last.start];
+    }
+  } finally {
+    db.close();
+  }
+  return path;
 }
 
 // A publisher leases the inactive slot from its first write until deploy, so
@@ -242,7 +283,7 @@ export async function releaseLease(api: Cloudflare, id: string, owner: string) {
 export async function activate(api: Cloudflare, id: string, owner: string) {
   const rows = await api.query(
     id,
-    "UPDATE metadata SET ready = 1, patch_from = NULL WHERE id = 1 AND EXISTS (SELECT 1 FROM lease WHERE owner = ?) RETURNING id",
+    "UPDATE metadata SET ready = 1 WHERE id = 1 AND EXISTS (SELECT 1 FROM lease WHERE owner = ?) RETURNING id",
     [owner],
   );
   if (rows.length !== 1) throw new SafeError("Lost the D1 slot lease before activation");

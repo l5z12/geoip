@@ -26,9 +26,9 @@ import {
   activate,
   chooseSlot,
   Cloudflare,
-  MAX_BASE_AGE_MS,
+  copySlot,
   MismatchError,
-  patchBase,
+  patchable,
   readyRelease,
   releaseLease,
   validateRemote,
@@ -140,10 +140,7 @@ test("full build validates probes, reports size, and exports an unready release"
     const restored = new DatabaseSync(":memory:");
     try {
       for (const file of files) restored.exec(await readFile(file, "utf8"));
-      expect(restored.prepare("SELECT ready, patch_from FROM metadata").get()).toEqual({
-        ready: 0,
-        patch_from: null,
-      });
+      expect(restored.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
     } finally {
       restored.close();
     }
@@ -199,73 +196,6 @@ test("an inserted or removed range moves only nearby block boundaries", () => {
   expect(startsBlock(key(0), BLOCK_MAX_RANGES)).toBe(true);
 });
 
-test("a patch turns the slot's release into the new build and is safe to rerun", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "geoip-d1-patch-"));
-  const url = pathToFileURL(dir + "/"),
-    baseUrl = new URL("base/", url),
-    epoch = Math.floor(Date.now() / 1000);
-  const asn = (number: number) => ({
-    autonomous_system_number: number,
-    autonomous_system_organization: `Network ${number}`,
-  });
-  const before = dataset(epoch, { asn: asn(64512) }),
-    after = dataset(epoch, { asn: asn(64513) });
-  const restored = new DatabaseSync(":memory:");
-  try {
-    await mkdir(baseUrl);
-    for (const kind of DATABASE_KINDS) {
-      await writeFile(new URL(`${kind}.mmdb`, baseUrl), before[kind]);
-      await writeFile(new URL(`${kind}.mmdb`, url), after[kind]);
-    }
-    const base = await buildD1(before.manifest, baseUrl);
-    const build = await buildD1(after.manifest, url);
-    for (const file of (await fullImport(base, baseUrl)).files)
-      restored.exec(await readFile(file, "utf8"));
-    restored.exec("UPDATE metadata SET ready = 1");
-    const patch = (await patchImport(build, base, before.manifest.version, url))!;
-    // The ASN record is replaced and its IPv4 and IPv6 blocks rewritten; the
-    // Country and City rows are untouched although their MMDB files differ.
-    expect(patch.rows).toBe(1 + 1 + 2 + 2);
-    expect(patch.from).toBe(before.manifest.version);
-    const expected = new DatabaseSync(build.path, { readOnly: true });
-    try {
-      // The second pass reruns a patch over its own result, as after an
-      // interrupted import.
-      for (let pass = 0; pass < 2; pass++) {
-        for (const file of patch.files) restored.exec(await readFile(file, "utf8"));
-        for (const query of [
-          "SELECT * FROM records ORDER BY id",
-          "SELECT * FROM blocks ORDER BY kind, family, start",
-        ])
-          expect(restored.prepare(query).all()).toEqual(expected.prepare(query).all());
-        expect(restored.prepare("SELECT data, ready, patch_from FROM metadata").get()).toEqual({
-          data: expected.prepare("SELECT data FROM metadata").get()!.data,
-          ready: 0,
-          patch_from: before.manifest.version,
-        });
-      }
-    } finally {
-      expected.close();
-    }
-    await expect(patchImport(build, base, before.manifest.version, url, 5)).rejects.toThrow(
-      "D1 import would write 6 rows, above D1_MAX_ROWS=5",
-    );
-    // When every record changes, a full import writes fewer rows.
-    const unrelated = dataset(epoch, {
-      country: { country: { iso_code: "CA" } },
-      city: { country: { iso_code: "CA" } },
-      asn: asn(64514),
-    });
-    for (const kind of DATABASE_KINDS)
-      await writeFile(new URL(`${kind}.mmdb`, baseUrl), unrelated[kind]);
-    const other = await buildD1(unrelated.manifest, baseUrl);
-    expect(await patchImport(build, other, unrelated.manifest.version, url)).toBeUndefined();
-  } finally {
-    restored.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
 /** A control API client whose D1 queries run against local SQLite. */
 function sqliteApi(db: DatabaseSync) {
   const request = vi.fn<typeof fetch>(async (_url, init) => {
@@ -280,46 +210,99 @@ function sqliteApi(db: DatabaseSync) {
   return { api: new Cloudflare("account", "secret", request), request };
 }
 
-test("only a ready slot or an interrupted patch toward the same release is patched", async () => {
+test("a patch rewrites every row that differs from the copied slot, hand edits included, and is safe to rerun", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "geoip-d1-patch-"));
+  const url = pathToFileURL(dir + "/"),
+    baseUrl = new URL("base/", url),
+    epoch = Math.floor(Date.now() / 1000);
+  const asn = (number: number) => ({
+    autonomous_system_number: number,
+    autonomous_system_organization: `Network ${number}`,
+  });
+  const before = dataset(epoch, { asn: asn(64512) }),
+    after = dataset(epoch, { asn: asn(64513) });
+  const slot = new DatabaseSync(":memory:");
+  try {
+    await mkdir(baseUrl);
+    for (const kind of DATABASE_KINDS) {
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), before[kind]);
+      await writeFile(new URL(`${kind}.mmdb`, url), after[kind]);
+    }
+    const base = await buildD1(before.manifest, baseUrl);
+    const build = await buildD1(after.manifest, url);
+    for (const file of (await fullImport(base, baseUrl)).files)
+      slot.exec(await readFile(file, "utf8"));
+    slot.exec("UPDATE metadata SET ready = 1");
+    // Edits by hand that keep every id, count, and probe result: the Country
+    // record's JSON and the hash of a City block. The release changed neither.
+    slot.exec(`UPDATE records SET data = '{"edited":true}' WHERE id < ${2 ** 48}`);
+    slot.exec("UPDATE blocks SET hash = hash + 1 WHERE kind = 1 AND family = 4");
+    // Tiny pages exercise the paging, including a final empty page.
+    const { api } = sqliteApi(slot);
+    const copy = await copySlot(api, "inactive", join(dir, "slot.sqlite"), {
+      records: 1,
+      blocks: 2,
+    });
+    const patch = (await patchImport(build, copy, url))!;
+    // The old ASN record is deleted and the new one written with its two
+    // blocks; the edited Country record and City block are restored; plus the
+    // metadata upsert and activation.
+    expect(patch.rows).toBe(1 + 1 + 2 + 1 + 1 + 2);
+    const expected = new DatabaseSync(build.path, { readOnly: true });
+    try {
+      // The second pass reruns a patch over its own result, as after an
+      // interrupted import.
+      for (let pass = 0; pass < 2; pass++) {
+        for (const file of patch.files) slot.exec(await readFile(file, "utf8"));
+        for (const query of [
+          "SELECT * FROM records ORDER BY id",
+          "SELECT * FROM blocks ORDER BY kind, family, start",
+        ])
+          expect(slot.prepare(query).all()).toEqual(expected.prepare(query).all());
+        expect(slot.prepare("SELECT data, ready FROM metadata").get()).toEqual({
+          data: expected.prepare("SELECT data FROM metadata").get()!.data,
+          ready: 0,
+        });
+      }
+    } finally {
+      expected.close();
+    }
+    await expect(patchImport(build, copy, url, 7)).rejects.toThrow(
+      "D1 import would write 8 rows, above D1_MAX_ROWS=7",
+    );
+    // When every record changes, a full import writes fewer rows.
+    const unrelated = dataset(epoch, {
+      country: { country: { iso_code: "CA" } },
+      city: { country: { iso_code: "CA" } },
+      asn: asn(64514),
+    });
+    for (const kind of DATABASE_KINDS)
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), unrelated[kind]);
+    const other = await buildD1(unrelated.manifest, baseUrl);
+    expect(await patchImport(build, other.path, url)).toBeUndefined();
+  } finally {
+    slot.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("only a slot with this schema's tables is patched, and API failures stop publishing", async () => {
   const db = new DatabaseSync(":memory:");
   try {
     const { api, request } = sqliteApi(db);
-    const data = dataset();
-    const metadata = JSON.stringify(releaseMetadata(data.manifest));
-    const [from, other] = ["b".repeat(64), "c".repeat(64)];
     // A new slot has no tables.
-    expect(await patchBase(api, "inactive", other)).toBeUndefined();
-    db.exec(D1_SCHEMA);
-    const set = (data: string, ready: number, patchFrom: string | null) =>
-      db.prepare("INSERT OR REPLACE INTO metadata VALUES (1, ?, ?, ?)").run(data, ready, patchFrom);
-    set(metadata, 1, null);
-    expect(await patchBase(api, "inactive", other)).toBe(data.manifest.version);
-    // Archives are pruned 29 days after upload, and a build dated 2 days ahead
-    // makes its upload look that much younger.
-    const built = Date.parse(data.manifest.updatedAt);
-    expect(await patchBase(api, "inactive", other, built + 25 * 86400000)).toBe(
-      data.manifest.version,
-    );
-    expect(MAX_BASE_AGE_MS + 2 * 86400000).toBeLessThan(29 * 86400000);
-    expect(await patchBase(api, "inactive", other, built + MAX_BASE_AGE_MS)).toBeUndefined();
-    set(metadata, 0, from);
-    expect(await patchBase(api, "inactive", data.manifest.version)).toBe(from);
-    expect(await patchBase(api, "inactive", other)).toBeUndefined();
-    set(metadata, 0, null);
-    expect(await patchBase(api, "inactive", data.manifest.version)).toBeUndefined();
-    set("not json", 1, null);
-    expect(await patchBase(api, "inactive", other)).toBeUndefined();
+    expect(await patchable(api, "inactive")).toBe(false);
+    // Full imports create tables from whitespace-collapsed statements.
+    for (const statement of D1_SCHEMA.split(";").filter((sql) => sql.trim()))
+      db.exec(statement.replace(/\s+/g, " ").trim());
+    expect(await patchable(api, "inactive")).toBe(true);
     db.exec("DROP TABLE blocks");
-    expect(await patchBase(api, "inactive", other)).toBeUndefined();
-    // Schema 2 metadata has no patch_from column.
-    db.exec(RESET_SQL + D1_SCHEMA.replace(", patch_from TEXT", ""));
-    db.prepare("INSERT INTO metadata VALUES (1, ?, 1)").run(
-      JSON.stringify({ ...releaseMetadata(data.manifest), schemaVersion: 2 }),
-    );
-    expect(await patchBase(api, "inactive", other)).toBeUndefined();
-    // An API failure is not a reason to import in full.
+    expect(await patchable(api, "inactive")).toBe(false);
+    // Schema 2 blocks had no hash column.
+    db.exec(RESET_SQL + D1_SCHEMA.replace("hash INTEGER NOT NULL, ", ""));
+    expect(await patchable(api, "inactive")).toBe(false);
     request.mockResolvedValueOnce(new Response(null, { status: 503 }));
-    await expect(patchBase(api, "inactive", other)).rejects.toThrow("HTTP 503");
+    await expect(patchable(api, "inactive")).rejects.toThrow("HTTP 503");
   } finally {
     db.close();
   }
@@ -336,7 +319,7 @@ test("a slot lease admits one publisher, survives full imports, and gates activa
       "Another publisher",
     );
     db.exec(RESET_SQL + D1_SCHEMA);
-    db.exec("INSERT INTO metadata VALUES (1, '{}', 0, 'x')");
+    db.exec("INSERT INTO metadata VALUES (1, '{}', 0)");
     await expect(acquireLease(api, "inactive", "b", now + 1000)).rejects.toThrow(
       "Another publisher",
     );
@@ -345,10 +328,7 @@ test("a slot lease admits one publisher, survives full imports, and gates activa
     await expect(activate(api, "inactive", "a")).rejects.toThrow("Lost");
     expect(db.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
     await activate(api, "inactive", "b");
-    expect(db.prepare("SELECT ready, patch_from FROM metadata").get()).toEqual({
-      ready: 1,
-      patch_from: null,
-    });
+    expect(db.prepare("SELECT ready FROM metadata").get()!.ready).toBe(1);
     await releaseLease(api, "inactive", "a");
     await expect(acquireLease(api, "inactive", "a", now + 3 * 60 * 60 * 1000)).rejects.toThrow();
     await releaseLease(api, "inactive", "b");

@@ -52,8 +52,6 @@ export interface BuildStats extends Checksum {
 export interface D1Import {
   files: string[];
   rows: number;
-  /** Release the slot must hold before a patch; absent for a full import. */
-  from?: string;
 }
 
 export function capacityLimit(value = process.env.D1_MAX_BYTES): number {
@@ -266,9 +264,8 @@ export async function fullImport(
   }
 }
 
-// Differences between this build (main) and the build of the slot's release
-// (base). Upserts and deletes are idempotent, so rerunning an interrupted
-// patch from the same base converges on the same rows.
+// Differences between this build (main) and a copy of the slot's rows (base).
+// Every column is compared, so rows edited by hand are rewritten too.
 const REMOVED_BLOCKS =
   "SELECT b.start FROM base.blocks AS b WHERE NOT EXISTS (SELECT 1 FROM main.blocks AS t WHERE t.kind = b.kind AND t.family = b.family AND t.start = b.start)";
 const REMOVED_RECORDS =
@@ -276,38 +273,38 @@ const REMOVED_RECORDS =
 const CHANGED_RECORDS =
   "SELECT t.id, t.data FROM main.records AS t LEFT JOIN base.records AS b ON b.id = t.id WHERE b.data IS NOT t.data";
 const CHANGED_BLOCKS =
-  "SELECT t.* FROM main.blocks AS t LEFT JOIN base.blocks AS b ON b.kind = t.kind AND b.family = t.family AND b.start = t.start WHERE b.data IS NOT t.data";
+  "SELECT t.* FROM main.blocks AS t LEFT JOIN base.blocks AS b ON b.kind = t.kind AND b.family = t.family AND b.start = t.start WHERE b.hash IS NOT t.hash OR b.data IS NOT t.data";
 
-/** Patch a slot holding release `from`, whose local build is `base`, into
- * `build`. Returns undefined when a full import would write no more rows. */
+/** Patch a slot whose rows were copied to `basePath` into `build`. Returns
+ * undefined when a full import would write no more rows. */
 export async function patchImport(
   build: BuildStats,
-  base: BuildStats,
-  from: string,
+  basePath: string,
   dir = DATA_DIR,
   maxRows = rowLimit(),
 ): Promise<D1Import | undefined> {
   const db = new DatabaseSync(build.path, { readOnly: true });
   try {
-    db.prepare("ATTACH DATABASE ? AS base").run(base.path);
+    db.prepare("ATTACH DATABASE ? AS base").run(basePath);
     const count = (query: string) =>
       (db.prepare(`SELECT COUNT(*) AS n FROM (${query})`).get() as { n: number }).n;
-    // One write per changed row, the metadata UPDATE, and the later activation.
+    // One write per changed row, the metadata upsert, and the later activation.
     const rows =
       count(REMOVED_BLOCKS) +
       count(REMOVED_RECORDS) +
       count(CHANGED_RECORDS) +
       count(CHANGED_BLOCKS) +
       2;
-    console.log(`D1 patch from ${from}: ${rows} rows written (full import: ${fullRows(build)})`);
+    console.log(`D1 patch: ${rows} rows written (full import: ${fullRows(build)})`);
     if (rows >= fullRows(build)) return undefined;
     checkRows(rows, maxRows);
     const sql = sqlFiles(dir, "d1-patch");
     try {
       const { data } = db.prepare("SELECT data FROM main.metadata").get() as { data: string };
-      // Unready first; a rerun finds `patch_from` and reapplies this patch.
+      // Unready first. An interrupted patch needs no bookkeeping: the next
+      // run copies whatever the slot then holds and diffs against that.
       await sql.write(
-        `UPDATE metadata SET data = ${sqlValue(data)}, ready = 0, patch_from = ${sqlValue(from)} WHERE id = 1;`,
+        `INSERT INTO metadata VALUES (1, ${sqlValue(data)}, 0) ON CONFLICT(id) DO UPDATE SET data = excluded.data, ready = 0;`,
       );
       for (const kind of DATABASE_KINDS.keys())
         for (const family of [4, 6])
@@ -332,7 +329,7 @@ export async function patchImport(
       await sql.close();
     }
     console.log(`D1 patch: ${sql.files.length} import files`);
-    return { files: sql.files, rows, from };
+    return { files: sql.files, rows };
   } finally {
     db.close();
   }
@@ -347,7 +344,7 @@ export async function buildD1(
   const db = new DatabaseSync(path);
   try {
     db.exec(RESET_SQL + "VACUUM;" + D1_SCHEMA);
-    db.prepare("INSERT INTO metadata VALUES (1, ?, 0, NULL)").run(
+    db.prepare("INSERT INTO metadata VALUES (1, ?, 0)").run(
       JSON.stringify(releaseMetadata(manifest)),
     );
     for (const [index, kind] of DATABASE_KINDS.entries()) {

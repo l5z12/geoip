@@ -16,7 +16,7 @@ export async function d1Fixture(data = dataset()) {
   sql.exec(D1_SCHEMA);
   for (const [index, kind] of DATABASE_KINDS.entries()) await addDatabase(sql, index, data[kind]);
   sql
-    .prepare("INSERT INTO metadata VALUES (1, ?, 1, NULL)")
+    .prepare("INSERT INTO metadata VALUES (1, ?, 1)")
     .run(JSON.stringify(releaseMetadata(data.manifest)));
   const calls: { constraint: string; query: string; params: unknown[] }[] = [];
   const replica = { fail: false, stale: false };
