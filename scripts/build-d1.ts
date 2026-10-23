@@ -11,7 +11,7 @@ import {
   type LookupRow,
 } from "../src/d1-schema";
 import { mmdbRanges } from "./mmdb-ranges";
-import { DATA_DIR, SafeError } from "./shared";
+import { DATA_DIR, SafeError, sha256 } from "./shared";
 
 export const PROBES = [
   "1.1.1.1",
@@ -25,16 +25,33 @@ export const PROBES = [
 // does not keep paying for that storage.
 export const RESET_SQL =
   "DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS ranges; DROP TABLE IF EXISTS blocks; DROP TABLE IF EXISTS records;";
-export const COUNTS_SQL =
-  "SELECT (SELECT COUNT(*) FROM blocks) AS blocks, (SELECT COUNT(*) FROM records) AS records";
-export const BLOCK_RANGES = 64;
-export interface BuildStats {
-  ranges: number;
+// One scan per table. Block hashes and record ids both derive from row
+// content, so matching sums show every row matches, not just the row counts.
+export const CHECKSUM_SQL =
+  "SELECT b.blocks, b.blockHash, r.records, r.recordHash FROM (SELECT COUNT(*) AS blocks, COALESCE(SUM(hash), 0) AS blockHash FROM blocks) AS b, (SELECT COUNT(*) AS records, COALESCE(SUM(id % 4294967296), 0) AS recordHash FROM records) AS r";
+export interface Checksum {
   blocks: number;
+  blockHash: number;
   records: number;
+  recordHash: number;
+}
+// Block boundaries are content-defined: once a block holds BLOCK_MIN_RANGES,
+// a range whose start hashes to a cut point (1 in BLOCK_CUT_ODDS) opens the
+// next one, about 64 ranges per block on average. Inserting or removing a range
+// moves only nearby boundaries, so a patch rewrites the blocks around each
+// change instead of every later block, as fixed-size runs would.
+export const BLOCK_MIN_RANGES = 32;
+export const BLOCK_CUT_ODDS = 32;
+export const BLOCK_MAX_RANGES = 256;
+export interface BuildStats extends Checksum {
+  ranges: number;
   bytes: number;
-  files: string[];
+  path: string;
   probes: LookupRow[][];
+}
+export interface D1Import {
+  files: string[];
+  rows: number;
 }
 
 export function capacityLimit(value = process.env.D1_MAX_BYTES): number {
@@ -53,36 +70,70 @@ export function rowLimit(value = process.env.D1_MAX_ROWS): number {
   return max;
 }
 
+export function isCutPoint(start: string): boolean {
+  // FNV-1a with the murmur3 finalizer: cheap, deterministic, and well mixed.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < start.length; i++) hash = Math.imul(hash ^ start.charCodeAt(i), 0x01000193);
+  hash = Math.imul(hash ^ (hash >>> 16), 0x85ebca6b);
+  hash = Math.imul(hash ^ (hash >>> 13), 0xc2b2ae35);
+  return ((hash ^ (hash >>> 16)) >>> 0) % BLOCK_CUT_ODDS === 0;
+}
+
+/** Whether a range starting at `start` opens a new block after `length` ranges. */
+export function startsBlock(start: string, length: number, maxRanges = BLOCK_MAX_RANGES) {
+  return length >= maxRanges || (length >= BLOCK_MIN_RANGES && isCutPoint(start));
+}
+
 export async function addDatabase(
   db: DatabaseSync,
   kind: number,
   bytes: Buffer,
-  blockRanges = BLOCK_RANGES,
+  maxRanges = BLOCK_MAX_RANGES,
 ) {
   const reader = await AsyncMmdb.open({
     size: bytes.length,
     read: async (offset, length) => bytes.subarray(offset, offset + length),
   });
   const insertRecord = db.prepare("INSERT INTO records VALUES (?, ?)");
-  const insertBlock = db.prepare("INSERT INTO blocks VALUES (?, ?, ?, ?)");
+  const findRecord = db.prepare("SELECT data FROM records WHERE id = ?");
+  const insertBlock = db.prepare("INSERT INTO blocks VALUES (?, ?, ?, ?, ?)");
   // Ranges arrive sorted by start within each family, IPv4 first.
   let block: [string, string, number, number][] = [],
     blockFamily = 0;
   function flush() {
-    if (block.length) insertBlock.run(kind, blockFamily, block[0]![0], JSON.stringify(block));
+    if (block.length) {
+      const data = JSON.stringify(block);
+      insertBlock.run(
+        kind,
+        blockFamily,
+        block[0]![0],
+        parseInt(sha256(data).slice(0, 8), 16),
+        data,
+      );
+    }
     block = [];
   }
-  const seen = new Set<number>();
+  // Ids hash the record content rather than its MMDB offset, which shifts on
+  // every rebuild, so unchanged records and the blocks citing them stay equal.
+  async function recordId(pointer: number): Promise<number> {
+    const data = JSON.stringify(await reader.record(pointer));
+    for (let hash = parseInt(sha256(data).slice(0, 12), 16); ; hash = (hash + 1) % 2 ** 48) {
+      // Probe past a 48-bit collision; equal content shares one row.
+      const id = kind * 2 ** 48 + hash;
+      const existing = findRecord.get(id) as { data: string } | undefined;
+      if (!existing) insertRecord.run(id, data);
+      if (!existing || existing.data === data) return id;
+    }
+  }
+  const ids = new Map<number, number>();
   let count = 0;
   db.exec("BEGIN");
   try {
     for (const range of mmdbRanges(bytes, reader.metadata)) {
-      const id = kind * 0x100000000 + range.pointer;
-      if (!seen.has(range.pointer)) {
-        insertRecord.run(id, JSON.stringify(await reader.record(range.pointer)));
-        seen.add(range.pointer);
-      }
-      if (range.family !== blockFamily || block.length >= blockRanges) flush();
+      let id = ids.get(range.pointer);
+      if (id === undefined) ids.set(range.pointer, (id = await recordId(range.pointer)));
+      if (range.family !== blockFamily || startsBlock(range.start, block.length, maxRanges))
+        flush();
       blockFamily = range.family;
       block.push([range.start, range.end, range.prefix, id]);
       if (++count % 50_000 === 0) db.exec("COMMIT; BEGIN");
@@ -103,13 +154,23 @@ export function localLookup(db: DatabaseSync, ip: string): LookupRow[] {
 }
 
 export function sqlValue(value: unknown): string {
+  if (value === null) return "NULL";
   if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
   if (typeof value === "string") return "'" + value.replaceAll("'", "''") + "'";
   throw new SafeError("Unexpected SQL export value");
 }
 
+function* tuples(db: DatabaseSync, query: string, params: (string | number)[] = []) {
+  for (const row of db.prepare(query).iterate(...params))
+    yield "(" + Object.values(row).map(sqlValue).join(",") + ")";
+}
+
+function* column(db: DatabaseSync, query: string, params: (string | number)[] = []) {
+  for (const row of db.prepare(query).iterate(...params)) yield sqlValue(Object.values(row)[0]);
+}
+
 /** Stream bounded statements/files; D1 imports cannot contain BEGIN/COMMIT. */
-export async function exportSql(db: DatabaseSync, dir: URL): Promise<string[]> {
+function sqlFiles(dir: URL, name: string) {
   const files: string[] = [];
   let file: Awaited<ReturnType<typeof open>> | undefined;
   let bytes = 0,
@@ -128,7 +189,7 @@ export async function exportSql(db: DatabaseSync, dir: URL): Promise<string[]> {
         await flush();
         await file.close();
       }
-      const path = fileURLToPath(new URL(`d1-${files.length}.sql`, dir));
+      const path = fileURLToPath(new URL(`${name}-${files.length}.sql`, dir));
       file = await open(path, "w");
       files.push(path);
       bytes = 0;
@@ -137,41 +198,147 @@ export async function exportSql(db: DatabaseSync, dir: URL): Promise<string[]> {
     bytes += size + 1;
     if (buffer.length >= 1024 * 1024) await flush();
   }
+  /** Join `head value,value... tail;` statements of at most 80 KB and 500 rows. */
+  async function batch(head: string, values: Iterable<string>, tail = "") {
+    const empty = Buffer.byteLength(head + tail) + 1;
+    let statement = head,
+      size = empty,
+      count = 0;
+    for (const value of values) {
+      const length = Buffer.byteLength(value) + 1;
+      if (count && (size + length > 80_000 || count >= 500)) {
+        await write(statement + tail + ";");
+        statement = head;
+        size = empty;
+        count = 0;
+      }
+      statement += (count ? "," : "") + value;
+      size += length;
+      count++;
+    }
+    if (count) await write(statement + tail + ";");
+  }
+  return { files, write, batch, flush, close: async () => file?.close() };
+}
+
+export async function exportSql(db: DatabaseSync, dir: URL): Promise<string[]> {
+  const sql = sqlFiles(dir, "d1");
   try {
     for (const statement of (RESET_SQL + D1_SCHEMA).split(";").filter((sql) => sql.trim()))
-      await write(statement.replace(/\s+/g, " ").trim() + ";");
-    for (const table of ["records", "blocks", "metadata"]) {
-      const head = `INSERT INTO ${table} VALUES `;
-      let statement = head,
-        size = Buffer.byteLength(head),
-        count = 0;
-      for (const row of db.prepare(`SELECT * FROM ${table}`).iterate()) {
-        const tuple = "(" + Object.values(row).map(sqlValue).join(",") + ")";
-        const length = Buffer.byteLength(tuple) + 1;
-        if (count && (size + length > 80_000 || count >= 500)) {
-          await write(statement + ";");
-          statement = head;
-          size = Buffer.byteLength(head);
-          count = 0;
-        }
-        statement += (count ? "," : "") + tuple;
-        size += length;
-        count++;
-      }
-      if (count) await write(statement + ";");
-    }
-    await flush();
+      await sql.write(statement.replace(/\s+/g, " ").trim() + ";");
+    for (const table of ["records", "blocks", "metadata"])
+      await sql.batch(`INSERT INTO ${table} VALUES `, tuples(db, `SELECT * FROM ${table}`));
+    await sql.flush();
   } finally {
-    await file?.close();
+    await sql.close();
   }
-  return files;
+  return sql.files;
+}
+
+function checkRows(rows: number, maxRows: number) {
+  if (rows > maxRows)
+    throw new SafeError(
+      `D1 import would write ${rows} rows, above D1_MAX_ROWS=${maxRows}; D1 bills every imported row`,
+    );
+}
+
+/** Every insert plus the metadata insert and the later `ready` UPDATE.
+ * Resetting a reused slot drops whole tables; production bills showed that
+ * DDL does not add a write per dropped row. */
+export const fullRows = (build: BuildStats) => build.blocks + build.records + 2;
+
+export async function fullImport(
+  build: BuildStats,
+  dir = DATA_DIR,
+  maxRows = rowLimit(),
+): Promise<D1Import> {
+  const rows = fullRows(build);
+  checkRows(rows, maxRows);
+  const db = new DatabaseSync(build.path, { readOnly: true });
+  try {
+    const files = await exportSql(db, dir);
+    console.log(`D1 full import: ${rows} rows written, ${files.length} import files`);
+    return { files, rows };
+  } finally {
+    db.close();
+  }
+}
+
+// Differences between this build (main) and a copy of the slot's rows (base).
+// Every column is compared, so rows edited by hand are rewritten too.
+const REMOVED_BLOCKS =
+  "SELECT b.start FROM base.blocks AS b WHERE NOT EXISTS (SELECT 1 FROM main.blocks AS t WHERE t.kind = b.kind AND t.family = b.family AND t.start = b.start)";
+const REMOVED_RECORDS =
+  "SELECT b.id FROM base.records AS b WHERE NOT EXISTS (SELECT 1 FROM main.records AS t WHERE t.id = b.id)";
+const CHANGED_RECORDS =
+  "SELECT t.id, t.data FROM main.records AS t LEFT JOIN base.records AS b ON b.id = t.id WHERE b.data IS NOT t.data";
+const CHANGED_BLOCKS =
+  "SELECT t.* FROM main.blocks AS t LEFT JOIN base.blocks AS b ON b.kind = t.kind AND b.family = t.family AND b.start = t.start WHERE b.hash IS NOT t.hash OR b.data IS NOT t.data";
+
+/** Patch a slot whose rows were copied to `basePath` into `build`. Returns
+ * undefined when a full import would write no more rows. */
+export async function patchImport(
+  build: BuildStats,
+  basePath: string,
+  dir = DATA_DIR,
+  maxRows = rowLimit(),
+): Promise<D1Import | undefined> {
+  const db = new DatabaseSync(build.path, { readOnly: true });
+  try {
+    db.prepare("ATTACH DATABASE ? AS base").run(basePath);
+    const count = (query: string) =>
+      (db.prepare(`SELECT COUNT(*) AS n FROM (${query})`).get() as { n: number }).n;
+    // One write per changed row, the metadata upsert, and the later activation.
+    const rows =
+      count(REMOVED_BLOCKS) +
+      count(REMOVED_RECORDS) +
+      count(CHANGED_RECORDS) +
+      count(CHANGED_BLOCKS) +
+      2;
+    console.log(`D1 patch: ${rows} rows written (full import: ${fullRows(build)})`);
+    if (rows >= fullRows(build)) return undefined;
+    checkRows(rows, maxRows);
+    const sql = sqlFiles(dir, "d1-patch");
+    try {
+      const { data } = db.prepare("SELECT data FROM main.metadata").get() as { data: string };
+      // Unready first. An interrupted patch needs no bookkeeping: the next
+      // run copies whatever the slot then holds and diffs against that.
+      await sql.write(
+        `INSERT INTO metadata VALUES (1, ${sqlValue(data)}, 0) ON CONFLICT(id) DO UPDATE SET data = excluded.data, ready = 0;`,
+      );
+      for (const kind of DATABASE_KINDS.keys())
+        for (const family of [4, 6])
+          await sql.batch(
+            `DELETE FROM blocks WHERE kind = ${kind} AND family = ${family} AND start IN (`,
+            column(db, `${REMOVED_BLOCKS} AND b.kind = ? AND b.family = ?`, [kind, family]),
+            ")",
+          );
+      await sql.batch("DELETE FROM records WHERE id IN (", column(db, REMOVED_RECORDS), ")");
+      await sql.batch(
+        "INSERT INTO records VALUES ",
+        tuples(db, CHANGED_RECORDS),
+        " ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+      );
+      await sql.batch(
+        "INSERT INTO blocks VALUES ",
+        tuples(db, CHANGED_BLOCKS),
+        " ON CONFLICT(kind, family, start) DO UPDATE SET hash = excluded.hash, data = excluded.data",
+      );
+      await sql.flush();
+    } finally {
+      await sql.close();
+    }
+    console.log(`D1 patch: ${sql.files.length} import files`);
+    return { files: sql.files, rows };
+  } finally {
+    db.close();
+  }
 }
 
 export async function buildD1(
   manifest: Manifest,
   dir = DATA_DIR,
   maxBytes = capacityLimit(),
-  maxRows = rowLimit(),
 ): Promise<BuildStats> {
   const path = fileURLToPath(new URL("lookup.sqlite", dir));
   const db = new DatabaseSync(path);
@@ -197,27 +364,18 @@ export async function buildD1(
           "D1 build exceeds D1_MAX_BYTES; check your account limit before increasing it",
         );
     }
-    const counts = db.prepare(COUNTS_SQL).get() as { blocks: number; records: number };
+    const checksum = { ...(db.prepare(CHECKSUM_SQL).get() as unknown as Checksum) };
     const { ranges } = db
       .prepare("SELECT COALESCE(SUM(json_array_length(data)), 0) AS ranges FROM blocks")
       .get() as { ranges: number };
     const bytes = (await stat(path)).size;
-    if (!counts.blocks || !counts.records || bytes > maxBytes)
+    if (!checksum.blocks || !checksum.records || bytes > maxBytes)
       throw new SafeError("D1 build is empty or exceeds capacity");
-    // Every insert plus the metadata insert and the later `ready` UPDATE.
-    // Resetting a reused slot drops whole tables; production bills showed that
-    // DDL does not add a write per dropped row.
-    const rows = counts.blocks + counts.records + 2;
-    if (rows > maxRows)
-      throw new SafeError(
-        `D1 build would write ${rows} rows, above D1_MAX_ROWS=${maxRows}; D1 bills every imported row`,
-      );
     const probes = PROBES.map((ip) => localLookup(db, ip));
-    const files = await exportSql(db, dir);
     console.log(
-      `D1 build: ${ranges} ranges in ${counts.blocks} blocks, ${counts.records} records, ${rows} rows written per import, ${bytes} bytes, ${files.length} import files`,
+      `D1 build: ${ranges} ranges in ${checksum.blocks} blocks, ${checksum.records} records, ${bytes} bytes`,
     );
-    return { ranges, ...counts, bytes, files, probes };
+    return { ranges, ...checksum, bytes, path, probes };
   } finally {
     db.close();
   }

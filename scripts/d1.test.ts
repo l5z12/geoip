@@ -1,7 +1,7 @@
 import { expect, test, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { Reader } from "mmdb-lib";
-import { mkdtemp, readFile, unlink, rmdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,13 +10,29 @@ import {
   buildD1,
   capacityLimit,
   exportSql,
+  fullImport,
   localLookup,
+  patchImport,
   rowLimit,
   sqlValue,
+  startsBlock,
+  BLOCK_MAX_RANGES,
   PROBES,
+  RESET_SQL,
   type BuildStats,
 } from "./build-d1";
-import { chooseSlot, Cloudflare, readyRelease, validateRemote } from "./d1-release";
+import {
+  acquireLease,
+  activate,
+  chooseSlot,
+  Cloudflare,
+  copySlot,
+  MismatchError,
+  patchable,
+  readyRelease,
+  releaseLease,
+  validateRemote,
+} from "./d1-release";
 import { D1_SCHEMA, releaseMetadata } from "../src/d1-schema";
 import { DATABASE_KINDS } from "../src/manifest";
 import { dataset, treeMmdb } from "../tests/fixtures";
@@ -112,28 +128,29 @@ test("full build validates probes, reports size, and exports an unready release"
   const dir = await mkdtemp(join(tmpdir(), "geoip-d1-build-"));
   const url = pathToFileURL(dir + "/"),
     data = dataset();
-  let build: BuildStats | undefined;
+  let files: string[] = [];
   try {
     for (const kind of DATABASE_KINDS) await writeFile(new URL(`${kind}.mmdb`, url), data[kind]);
-    build = await buildD1(data.manifest, url);
+    const build = await buildD1(data.manifest, url);
     expect(build.ranges).toBe(6);
     expect(build.blocks).toBe(6);
     expect(build.records).toBe(3);
     expect(build.bytes).toBeGreaterThan(0);
+    ({ files } = await fullImport(build, url));
     const restored = new DatabaseSync(":memory:");
     try {
-      for (const file of build.files) restored.exec(await readFile(file, "utf8"));
+      for (const file of files) restored.exec(await readFile(file, "utf8"));
       expect(restored.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
     } finally {
       restored.close();
     }
     await expect(buildD1(data.manifest, url, 1)).rejects.toThrow("D1_MAX_BYTES");
     // 6 blocks + 3 records + the metadata insert and its `ready` UPDATE.
-    await expect(buildD1(data.manifest, url, undefined, 10)).rejects.toThrow(
-      "D1 build would write 11 rows, above D1_MAX_ROWS=10",
+    await expect(fullImport(build, url, 10)).rejects.toThrow(
+      "D1 import would write 11 rows, above D1_MAX_ROWS=10",
     );
   } finally {
-    for (const file of build?.files ?? []) await unlink(file);
+    for (const file of files) await unlink(file);
     for (const kind of DATABASE_KINDS) await unlink(new URL(`${kind}.mmdb`, url));
     await unlink(new URL("lookup.sqlite", url));
     await rmdir(dir);
@@ -145,6 +162,180 @@ test("full build validates probes, reports size, and exports an unready release"
   expect(rowLimit("250000")).toBe(250000);
   for (const value of ["0", "-1", "100000001", "1.5", "NaN"])
     expect(() => rowLimit(value)).toThrow();
+});
+
+test("an inserted or removed range moves only nearby block boundaries", () => {
+  const key = (value: number) => (0x08000000 + value).toString(16).padStart(8, "0");
+  function boundaries(starts: string[]) {
+    const result: string[] = [];
+    let length = 0;
+    for (const start of starts) {
+      if (!result.length || startsBlock(start, length)) {
+        result.push(start);
+        length = 0;
+      }
+      length++;
+    }
+    return result;
+  }
+  const starts = Array.from({ length: 20_000 }, (_, i) => key(i * 4));
+  const before = boundaries(starts);
+  // About 64 ranges per block, as with the previous fixed-size blocks.
+  expect(starts.length / before.length).toBeGreaterThan(48);
+  expect(starts.length / before.length).toBeLessThan(80);
+  for (const edited of [
+    [...starts.slice(0, 7_000), key(27_998), ...starts.slice(7_000)],
+    [...starts.slice(0, 7_000), ...starts.slice(7_001)],
+  ]) {
+    const after = boundaries(edited);
+    const moved =
+      before.filter((start) => !after.includes(start)).length +
+      after.filter((start) => !before.includes(start)).length;
+    expect(moved).toBeLessThanOrEqual(4);
+  }
+  expect(startsBlock(key(0), BLOCK_MAX_RANGES)).toBe(true);
+});
+
+/** A control API client whose D1 queries run against local SQLite. */
+function sqliteApi(db: DatabaseSync) {
+  const request = vi.fn<typeof fetch>(async (_url, init) => {
+    const { sql, params } = JSON.parse(init!.body as string);
+    try {
+      const results = db.prepare(sql).all(...params);
+      return Response.json({ success: true, result: [{ success: true, results }] });
+    } catch {
+      return Response.json({ success: false }, { status: 400 });
+    }
+  });
+  return { api: new Cloudflare("account", "secret", request), request };
+}
+
+test("a patch rewrites every row that differs from the copied slot, hand edits included, and is safe to rerun", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "geoip-d1-patch-"));
+  const url = pathToFileURL(dir + "/"),
+    baseUrl = new URL("base/", url),
+    epoch = Math.floor(Date.now() / 1000);
+  const asn = (number: number) => ({
+    autonomous_system_number: number,
+    autonomous_system_organization: `Network ${number}`,
+  });
+  const before = dataset(epoch, { asn: asn(64512) }),
+    after = dataset(epoch, { asn: asn(64513) });
+  const slot = new DatabaseSync(":memory:");
+  try {
+    await mkdir(baseUrl);
+    for (const kind of DATABASE_KINDS) {
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), before[kind]);
+      await writeFile(new URL(`${kind}.mmdb`, url), after[kind]);
+    }
+    const base = await buildD1(before.manifest, baseUrl);
+    const build = await buildD1(after.manifest, url);
+    for (const file of (await fullImport(base, baseUrl)).files)
+      slot.exec(await readFile(file, "utf8"));
+    slot.exec("UPDATE metadata SET ready = 1");
+    // Edits by hand that keep every id, count, and probe result: the Country
+    // record's JSON and the hash of a City block. The release changed neither.
+    slot.exec(`UPDATE records SET data = '{"edited":true}' WHERE id < ${2 ** 48}`);
+    slot.exec("UPDATE blocks SET hash = hash + 1 WHERE kind = 1 AND family = 4");
+    // Tiny pages exercise the paging, including a final empty page.
+    const { api } = sqliteApi(slot);
+    const copy = await copySlot(api, "inactive", join(dir, "slot.sqlite"), {
+      records: 1,
+      blocks: 2,
+    });
+    const patch = (await patchImport(build, copy, url))!;
+    // The old ASN record is deleted and the new one written with its two
+    // blocks; the edited Country record and City block are restored; plus the
+    // metadata upsert and activation.
+    expect(patch.rows).toBe(1 + 1 + 2 + 1 + 1 + 2);
+    const expected = new DatabaseSync(build.path, { readOnly: true });
+    try {
+      // The second pass reruns a patch over its own result, as after an
+      // interrupted import.
+      for (let pass = 0; pass < 2; pass++) {
+        for (const file of patch.files) slot.exec(await readFile(file, "utf8"));
+        for (const query of [
+          "SELECT * FROM records ORDER BY id",
+          "SELECT * FROM blocks ORDER BY kind, family, start",
+        ])
+          expect(slot.prepare(query).all()).toEqual(expected.prepare(query).all());
+        expect(slot.prepare("SELECT data, ready FROM metadata").get()).toEqual({
+          data: expected.prepare("SELECT data FROM metadata").get()!.data,
+          ready: 0,
+        });
+      }
+    } finally {
+      expected.close();
+    }
+    await expect(patchImport(build, copy, url, 7)).rejects.toThrow(
+      "D1 import would write 8 rows, above D1_MAX_ROWS=7",
+    );
+    // When every record changes, a full import writes fewer rows.
+    const unrelated = dataset(epoch, {
+      country: { country: { iso_code: "CA" } },
+      city: { country: { iso_code: "CA" } },
+      asn: asn(64514),
+    });
+    for (const kind of DATABASE_KINDS)
+      await writeFile(new URL(`${kind}.mmdb`, baseUrl), unrelated[kind]);
+    const other = await buildD1(unrelated.manifest, baseUrl);
+    expect(await patchImport(build, other.path, url)).toBeUndefined();
+  } finally {
+    slot.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("only a slot with this schema's tables is patched, and API failures stop publishing", async () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    const { api, request } = sqliteApi(db);
+    // A new slot has no tables.
+    expect(await patchable(api, "inactive")).toBe(false);
+    // Full imports create tables from whitespace-collapsed statements.
+    for (const statement of D1_SCHEMA.split(";").filter((sql) => sql.trim()))
+      db.exec(statement.replace(/\s+/g, " ").trim());
+    expect(await patchable(api, "inactive")).toBe(true);
+    db.exec("DROP TABLE blocks");
+    expect(await patchable(api, "inactive")).toBe(false);
+    // Schema 2 blocks had no hash column.
+    db.exec(RESET_SQL + D1_SCHEMA.replace("hash INTEGER NOT NULL, ", ""));
+    expect(await patchable(api, "inactive")).toBe(false);
+    request.mockResolvedValueOnce(new Response(null, { status: 503 }));
+    await expect(patchable(api, "inactive")).rejects.toThrow("HTTP 503");
+  } finally {
+    db.close();
+  }
+});
+
+test("a slot lease admits one publisher, survives full imports, and gates activation", async () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    const { api } = sqliteApi(db);
+    const now = Date.now();
+    await acquireLease(api, "inactive", "a", now);
+    await acquireLease(api, "inactive", "a", now + 1000);
+    await expect(acquireLease(api, "inactive", "b", now + 1000)).rejects.toThrow(
+      "Another publisher",
+    );
+    db.exec(RESET_SQL + D1_SCHEMA);
+    db.exec("INSERT INTO metadata VALUES (1, '{}', 0)");
+    await expect(acquireLease(api, "inactive", "b", now + 1000)).rejects.toThrow(
+      "Another publisher",
+    );
+    // An abandoned lease expires.
+    await acquireLease(api, "inactive", "b", now + 3 * 60 * 60 * 1000);
+    await expect(activate(api, "inactive", "a")).rejects.toThrow("Lost");
+    expect(db.prepare("SELECT ready FROM metadata").get()!.ready).toBe(0);
+    await activate(api, "inactive", "b");
+    expect(db.prepare("SELECT ready FROM metadata").get()!.ready).toBe(1);
+    await releaseLease(api, "inactive", "a");
+    await expect(acquireLease(api, "inactive", "a", now + 3 * 60 * 60 * 1000)).rejects.toThrow();
+    await releaseLease(api, "inactive", "b");
+    await acquireLease(api, "inactive", "a", now + 3 * 60 * 60 * 1000);
+  } finally {
+    db.close();
+  }
 });
 
 test("slot selection never selects the live database or accepts an unmanaged live binding", () => {
@@ -185,21 +376,28 @@ test("control API distinguishes a missing Worker from permission failures and ch
 test("remote validation rejects partial imports and probe mismatches before activation", async () => {
   const request = vi.fn<typeof fetch>();
   const api = new Cloudflare("account", "secret", request);
+  const sums = { blocks: 6, blockHash: 123, records: 3, recordHash: 456 };
   const build: BuildStats = {
     ranges: 6,
-    blocks: 6,
-    records: 3,
+    ...sums,
     bytes: 1000,
-    files: [],
+    path: "",
     probes: PROBES.map(() => [{ kind: 0, prefix: 24, data: "{}" }]),
   };
   const result = (results: unknown[]) =>
     Response.json({ success: true, result: [{ success: true, results }] });
-  request.mockResolvedValueOnce(result([{ blocks: 5, records: 3 }]));
+  request.mockResolvedValueOnce(result([{ ...sums, blocks: 5 }]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("row counts");
-  request.mockResolvedValueOnce(result([{ blocks: 6, records: 3 }]));
+  // Equal counts with a stale row inside still differ by content.
+  request.mockResolvedValueOnce(result([{ ...sums, blockHash: 124 }]));
+  await expect(validateRemote(api, "inactive", build)).rejects.toThrow(MismatchError);
+  request.mockResolvedValueOnce(result([sums]));
   request.mockResolvedValueOnce(result([]));
   await expect(validateRemote(api, "inactive", build)).rejects.toThrow("records differ");
+  // Operational failures are not mismatches, so they never force a full import.
+  request.mockResolvedValueOnce(new Response(null, { status: 502 }));
+  const failure = await validateRemote(api, "inactive", build).catch((error) => error);
+  expect(failure).not.toBeInstanceOf(MismatchError);
   const data = dataset();
   request.mockResolvedValueOnce(
     result([{ kind: -1, prefix: null, data: JSON.stringify(releaseMetadata(data.manifest)) }]),

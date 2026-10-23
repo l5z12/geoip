@@ -288,13 +288,16 @@ test("publication commits immutable manifest before active pointer", () => {
       asn: { key: "versions/v/asn.mmdb" },
     },
   } as Manifest;
-  expect(publicationPlan(manifest).map((p) => p.key)).toEqual([
+  // The whole versioned archive precedes any D1 write, so a slot marked ready
+  // always has a downloadable patch base; the pointer follows D1 validation.
+  const plan = publicationPlan(manifest);
+  expect(plan.archive.map((p) => p.key)).toEqual([
     "versions/v/country.mmdb",
     "versions/v/city.mmdb",
     "versions/v/asn.mmdb",
     "versions/v/manifest.json",
-    "manifest.json",
   ]);
+  expect(plan.pointer.key).toBe("manifest.json");
   expect(publishMode([])).toBe("--remote");
   expect(publishMode(["--local"])).toBe("--local");
   expect(() => publishMode(["--local", "--remote"])).toThrow();
